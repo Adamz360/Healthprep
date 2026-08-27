@@ -1,0 +1,62 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html,
+  body,
+  #app {
+    height: 100%;
+  }
+
+  body {
+    @apply bg-canvas text-ink-900 antialiased font-sans;
+    -webkit-tap-highlight-color: transparent;
+    font-feature-settings: 'ss01' 1;
+  }
+
+  h1,
+  h2,
+  h3,
+  .font-display {
+    letter-spacing: -0.01em;
+  }
+
+  /* Tabular, monospace figures for anything "live": timers, scores, credits.
+     This is the app's core visual convention — mono digits = live data. */
+  .font-mono {
+    font-feature-settings: 'tnum' 1, 'zero' 1;
+  }
+
+  /* Respect reduced-motion preferences app-wide */
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+      scroll-behavior: auto !important;
+    }
+  }
+
+  /* Visible keyboard focus everywhere — important for exam-hall accessibility */
+  :focus-visible {
+    outline: 2px solid #2ee6b8;
+    outline-offset: 2px;
+  }
+
+  ::selection {
+    background-color: #b8f7e7;
+    color: #0b1f1e;
+  }
+}
+
+@layer components {
+  /* The "vital readout" — dark teal chip with mono digits. Used for every
+     piece of live/dynamic numeric data across the app: timer, credits,
+     streak, score. A recognizable convention, not decoration. */
+  .readout {
+    @apply inline-flex items-center gap-2 rounded-xl bg-ink-900 text-pulse font-mono font-semibold px-3 py-1.5;
+  }
+}
