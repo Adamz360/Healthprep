@@ -22,6 +22,7 @@ import type {
   PaymentStats,
   PaymentStatsBucket,
   RecentActivityItem,
+  PasswordResetToken,
 } from '../types/healthApp';
 import { generateSalt, hashPassword } from '../utils/crypto';
 
@@ -55,6 +56,7 @@ export class CbtDatabase extends Dexie {
   video_bookmarks!: Table<VideoBookmark, string>;
   leaderboard_mock!: Table<LeaderboardMockRecord, string>;
   payments!: Table<Payment, string>;
+  passwordResetTokens!: Table<PasswordResetToken, string>;
 
   constructor() {
     super('CbtDatabase');
@@ -89,6 +91,10 @@ export class CbtDatabase extends Dexie {
       courses: 'id, departmentId, slug',
       subjects: 'id, departmentId, courseId, slug',
       payments: 'id, userId, status, createdAt, reference',
+    });
+    
+    this.version(3).stores({
+      passwordResetTokens: 'id, token, email, userId, expiresAt, used',
     });
   }
 }

@@ -373,3 +373,13 @@ export interface RecentActivityItem {
   subtitle: string;
   timestamp: string;
 }
+
+export interface PasswordResetToken {
+  id: string;
+  userId: string;
+  email: string;
+  token: string;
+  expiresAt: string;   // ISO timestamp
+  used: boolean;
+  createdAt: string;
+}

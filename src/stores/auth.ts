@@ -9,6 +9,8 @@ import { defineStore } from 'pinia';
 import { db, uid } from '../db';
 import { generateSalt, hashPassword, verifyPassword, isValidEmail } from '../utils/crypto';
 import type { User } from '../types/healthApp';
+import { sendPasswordResetEmail } from '../utils/email';
+import type { PasswordResetToken } from '../types/healthApp';
 
 const AUTH_USER_ID_KEY = 'healthcbt:authUserId';
 
@@ -262,9 +264,10 @@ export const useAuthStore = defineStore('auth', {
       await db.users.delete(userId);
       return { success: true };
     },
-    /**
- * Step 1: Verify the email exists before showing the reset form.
- */
+  /**
+   * Step 1: Verify email, generate a time-limited token, and send a
+   * reset link via EmailJS.
+   */
   async requestPasswordReset(email: string): Promise<{ success: boolean; error?: string }> {
     this.authError = null;
     const normalizedEmail = email.trim().toLowerCase();
@@ -274,26 +277,86 @@ export const useAuthStore = defineStore('auth', {
     const user = await db.users.where('email').equals(normalizedEmail).first();
     if (!user) return this.fail('No account found for this email.');
 
+    // Invalidate any previous unused tokens for this email
+    const oldTokens = await db.passwordResetTokens
+      .where('email')
+      .equals(normalizedEmail)
+      .filter((t) => !t.used)
+      .toArray();
+    for (const t of oldTokens) {
+      await db.passwordResetTokens.put({ ...t, used: true });
+    }
+
+    // Generate a secure random token
+    const array = new Uint8Array(32);
+    crypto.getRandomValues(array);
+    const token = Array.from(array, (b) => b.toString(16).padStart(2, '0')).join('');
+
+    const expiresAt = new Date(Date.now() + 30 * 60 * 1000).toISOString(); // 30 minutes
+
+    const resetToken: PasswordResetToken = {
+      id: uid('reset'),
+      userId: user.id,
+      email: normalizedEmail,
+      token,
+      expiresAt,
+      used: false,
+      createdAt: new Date().toISOString(),
+    };
+
+    await db.passwordResetTokens.add(resetToken);
+
+    // Build the reset link
+    const baseUrl = window.location.origin;
+    const resetLink = `${baseUrl}/reset-password?token=${token}`;
+
+    // Send the email
+    const result = await sendPasswordResetEmail(user.fullName, normalizedEmail, resetLink);
+
+    if (!result.success) return this.fail(result.error ?? 'Failed to send reset email.');
+
     return { success: true };
   },
 
   /**
-   * Step 2: Hash and persist the new password.
+   * Step 2: Validate the token from the email link.
+   * Returns the associated email if valid.
    */
-  async resetPassword(email: string, newPassword: string): Promise<{ success: boolean; error?: string }> {
+  async validateResetToken(token: string): Promise<{ valid: boolean; email?: string; error?: string }> {
+    const record = await db.passwordResetTokens.where('token').equals(token).first();
+
+    if (!record) return { valid: false, error: 'Invalid or expired reset link.' };
+    if (record.used) return { valid: false, error: 'This reset link has already been used.' };
+    if (new Date(record.expiresAt) < new Date()) return { valid: false, error: 'This reset link has expired.' };
+
+    return { valid: true, email: record.email };
+  },
+
+  /**
+   * Step 3: Reset the password using a valid token.
+   */
+  async resetPasswordWithToken(token: string, newPassword: string): Promise<{ success: boolean; error?: string }> {
     this.authError = null;
-    const normalizedEmail = email.trim().toLowerCase();
 
     if (newPassword.length < 6) return this.fail('Password must be at least 6 characters.');
 
-    const user = await db.users.where('email').equals(normalizedEmail).first();
-    if (!user) return this.fail('No account found for this email.');
+    const record = await db.passwordResetTokens.where('token').equals(token).first();
+
+    if (!record) return this.fail('Invalid or expired reset link.');
+    if (record.used) return this.fail('This reset link has already been used.');
+    if (new Date(record.expiresAt) < new Date()) return this.fail('This reset link has expired.');
+
+    const user = await db.users.get(record.userId);
+    if (!user) return this.fail('User account not found.');
 
     const salt = generateSalt();
     const passwordHash = await hashPassword(newPassword, salt);
 
     const updated: User = { ...user, passwordHash, passwordSalt: salt };
     await db.users.put(updated);
+
+    // Mark token as used
+    await db.passwordResetTokens.put({ ...record, used: true });
 
     return { success: true };
   },
