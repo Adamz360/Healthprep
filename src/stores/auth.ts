@@ -262,5 +262,40 @@ export const useAuthStore = defineStore('auth', {
       await db.users.delete(userId);
       return { success: true };
     },
+    /**
+ * Step 1: Verify the email exists before showing the reset form.
+ */
+  async requestPasswordReset(email: string): Promise<{ success: boolean; error?: string }> {
+    this.authError = null;
+    const normalizedEmail = email.trim().toLowerCase();
+
+    if (!isValidEmail(normalizedEmail)) return this.fail('Please enter a valid email address.');
+
+    const user = await db.users.where('email').equals(normalizedEmail).first();
+    if (!user) return this.fail('No account found for this email.');
+
+    return { success: true };
+  },
+
+  /**
+   * Step 2: Hash and persist the new password.
+   */
+  async resetPassword(email: string, newPassword: string): Promise<{ success: boolean; error?: string }> {
+    this.authError = null;
+    const normalizedEmail = email.trim().toLowerCase();
+
+    if (newPassword.length < 6) return this.fail('Password must be at least 6 characters.');
+
+    const user = await db.users.where('email').equals(normalizedEmail).first();
+    if (!user) return this.fail('No account found for this email.');
+
+    const salt = generateSalt();
+    const passwordHash = await hashPassword(newPassword, salt);
+
+    const updated: User = { ...user, passwordHash, passwordSalt: salt };
+    await db.users.put(updated);
+
+    return { success: true };
+  },
   },
 });

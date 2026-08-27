@@ -113,6 +113,14 @@ async function handleSubmit() {
           <AlertCircle class="w-4 h-4 shrink-0" />
           {{ errorMessage }}
         </p>
+        <div class="text-right mt-1.5">
+          <router-link
+            :to="{ name: 'forgot-password' }"
+            class="text-xs font-semibold text-brand-600 hover:text-brand-700"
+          >
+            Forgot password?
+          </router-link>
+        </div>
 
         <button
           type="submit"
@@ -123,6 +131,7 @@ async function handleSubmit() {
           {{ isSubmitting ? 'Signing in…' : 'Sign In' }}
         </button>
       </form>
+      
 
       <!-- Demo/test account notes -->
       <div class="relative mt-4 space-y-2">

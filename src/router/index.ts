@@ -105,6 +105,12 @@ const router = createRouter({
       path: '/:pathMatch(.*)*',
       redirect: '/',
     },
+    {
+      path: '/forgot-password',
+      name: 'forgot-password',
+      component: () => import('../views/ForgotPasswordView.vue'),
+      meta: { public: true },
+    },
   ],
 });
 
