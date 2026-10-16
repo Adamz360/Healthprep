@@ -1,7 +1,8 @@
+<!-- src/views/LoginView.vue -->
 <script setup lang="ts">
 import { ref } from 'vue';
 import { useRouter, useRoute } from 'vue-router';
-import { Eye, EyeOff, LogIn, AlertCircle, FlaskConical, ShieldCheck } from 'lucide-vue-next';
+import { Eye, EyeOff, LogIn, AlertCircle } from 'lucide-vue-next';
 import { useAuthStore } from '../stores/auth';
 import PulseLine from '../components/PulseLine.vue';
 
@@ -9,28 +10,11 @@ const router = useRouter();
 const route = useRoute();
 const auth = useAuthStore();
 
-const DEMO_EMAIL = 'user@example.com';
-const DEMO_PASSWORD = 'password123';
-const ADMIN_EMAIL = 'admin@example.com';
-const ADMIN_PASSWORD = 'admin12345';
-
 const email = ref('');
 const password = ref('');
 const showPassword = ref(false);
 const isSubmitting = ref(false);
 const errorMessage = ref<string | null>(null);
-
-function fillDemoCredentials() {
-  email.value = DEMO_EMAIL;
-  password.value = DEMO_PASSWORD;
-  errorMessage.value = null;
-}
-
-function fillAdminCredentials() {
-  email.value = ADMIN_EMAIL;
-  password.value = ADMIN_PASSWORD;
-  errorMessage.value = null;
-}
 
 async function handleSubmit() {
   errorMessage.value = null;
@@ -73,6 +57,7 @@ async function handleSubmit() {
       </div>
 
       <form class="relative bg-white rounded-3xl shadow-panel p-6 space-y-4" @submit.prevent="handleSubmit">
+        <!-- Email -->
         <div>
           <label for="email" class="block text-xs font-semibold text-ink-500 mb-1.5">Email</label>
           <input
@@ -86,8 +71,17 @@ async function handleSubmit() {
           />
         </div>
 
+        <!-- Password -->
         <div>
-          <label for="password" class="block text-xs font-semibold text-ink-500 mb-1.5">Password</label>
+          <div class="flex items-center justify-between mb-1.5">
+            <label for="password" class="block text-xs font-semibold text-ink-500">Password</label>
+            <router-link
+              :to="{ name: 'forgot-password' }"
+              class="text-xs font-semibold text-brand-600 hover:text-brand-700"
+            >
+              Forgot password?
+            </router-link>
+          </div>
           <div class="relative">
             <input
               id="password"
@@ -109,19 +103,16 @@ async function handleSubmit() {
           </div>
         </div>
 
-        <p v-if="errorMessage" class="flex items-center gap-1.5 text-sm text-coral-dim bg-coral-soft border border-coral/30 rounded-xl px-3.5 py-2.5">
+        <!-- Error -->
+        <p
+          v-if="errorMessage"
+          class="flex items-center gap-1.5 text-sm text-coral-dim bg-coral-soft border border-coral/30 rounded-xl px-3.5 py-2.5"
+        >
           <AlertCircle class="w-4 h-4 shrink-0" />
           {{ errorMessage }}
         </p>
-        <div class="text-right mt-1.5">
-          <router-link
-            :to="{ name: 'forgot-password' }"
-            class="text-xs font-semibold text-brand-600 hover:text-brand-700"
-          >
-            Forgot password?
-          </router-link>
-        </div>
 
+        <!-- Submit -->
         <button
           type="submit"
           class="w-full inline-flex items-center justify-center gap-1.5 rounded-xl bg-brand-700 hover:bg-brand-800 text-white font-semibold py-3 disabled:opacity-50 transition-colors"
@@ -131,42 +122,13 @@ async function handleSubmit() {
           {{ isSubmitting ? 'Signing in…' : 'Sign In' }}
         </button>
       </form>
-      
 
-      <!-- Demo/test account notes -->
-      <div class="relative mt-4 space-y-2">
-        <button
-          type="button"
-          class="w-full flex items-center gap-2.5 rounded-xl bg-white/10 border border-white/15 px-3.5 py-2.5 text-left hover:bg-white/15 transition-colors"
-          @click="fillDemoCredentials"
-        >
-          <span class="flex items-center justify-center w-7 h-7 rounded-lg bg-pulse/20 text-pulse shrink-0">
-            <FlaskConical class="w-3.5 h-3.5" />
-          </span>
-          <span class="min-w-0">
-            <span class="block text-[11px] font-semibold text-pulse uppercase tracking-wide">Test account</span>
-            <span class="block text-xs text-white/80 font-mono truncate">{{ DEMO_EMAIL }} · {{ DEMO_PASSWORD }}</span>
-          </span>
-        </button>
-
-        <button
-          type="button"
-          class="w-full flex items-center gap-2.5 rounded-xl bg-white/10 border border-white/15 px-3.5 py-2.5 text-left hover:bg-white/15 transition-colors"
-          @click="fillAdminCredentials"
-        >
-          <span class="flex items-center justify-center w-7 h-7 rounded-lg bg-gold/20 text-gold shrink-0">
-            <ShieldCheck class="w-3.5 h-3.5" />
-          </span>
-          <span class="min-w-0">
-            <span class="block text-[11px] font-semibold text-gold uppercase tracking-wide">Admin account</span>
-            <span class="block text-xs text-white/80 font-mono truncate">{{ ADMIN_EMAIL }} · {{ ADMIN_PASSWORD }}</span>
-          </span>
-        </button>
-      </div>
-
+      <!-- Register link -->
       <p class="relative text-center text-white/80 text-sm mt-5">
         New here?
-        <router-link :to="{ name: 'register' }" class="font-semibold text-pulse hover:underline">Create an account</router-link>
+        <router-link :to="{ name: 'register' }" class="font-semibold text-pulse hover:underline">
+          Create an account
+        </router-link>
       </p>
     </div>
   </div>

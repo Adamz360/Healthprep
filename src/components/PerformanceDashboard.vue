@@ -1,15 +1,14 @@
+<!-- src/components/PerformanceDashboard.vue -->
 <script setup lang="ts">
 import { ref, computed, onMounted, nextTick } from 'vue';
 import confetti from 'canvas-confetti';
 import { Share2, Trophy, TrendingDown, TrendingUp, RotateCcw, Download } from 'lucide-vue-next';
-import { db } from '../db';
+import { getDoc, doc } from 'firebase/firestore';
+import { firestore } from '../firebase';
 import { useWeakAreaEngine } from '../composables/useWeakAreaEngine';
 import PulseLine from './PulseLine.vue';
 import type { ExamSession, Subject, PerformanceSummary, TopicMastery } from '../types/healthApp';
-
-/* -------------------------------------------------------------------------- */
-/*  Props / Emits                                                             */
-/* -------------------------------------------------------------------------- */
+/* ── Props / Emits ──────────────────────────────────────────────────────── */
 
 const props = defineProps<{
   examSessionId: string;
@@ -21,9 +20,7 @@ const emit = defineEmits<{
   (e: 'back-to-dashboard'): void;
 }>();
 
-/* -------------------------------------------------------------------------- */
-/*  State                                                                     */
-/* -------------------------------------------------------------------------- */
+/* ── State ──────────────────────────────────────────────────────────────── */
 
 const session = ref<ExamSession | null>(null);
 const subject = ref<Subject | null>(null);
@@ -31,11 +28,13 @@ const cardCanvasRef = ref<HTMLCanvasElement | null>(null);
 const isLoading = ref(true);
 const shareStatus = ref<'idle' | 'shared' | 'copied' | 'error'>('idle');
 
-const { topicMastery, weakTopics, strongTopics, analyze, buildRecommendations } = useWeakAreaEngine(props.userId);
+const {
+  weakTopics,
+  strongTopics,
+  build,
+} = useWeakAreaEngine(props.userId);
 
-/* -------------------------------------------------------------------------- */
-/*  Derived summary                                                           */
-/* -------------------------------------------------------------------------- */
+/* ── Derived summary ────────────────────────────────────────────────────── */
 
 function badgeForScore(scorePercent: number): PerformanceSummary['accuracyBadge'] {
   if (scorePercent >= 90) return 'Platinum';
@@ -54,7 +53,21 @@ const badgeStyles: Record<PerformanceSummary['accuracyBadge'], string> = {
 const summary = computed<PerformanceSummary | null>(() => {
   if (!session.value || !subject.value) return null;
   const scorePercent = session.value.scorePercent ?? 0;
-  const timeTakenSeconds = session.value.durationSeconds - (session.value.remainingSeconds ?? 0);
+  const timeTakenSeconds =
+    (session.value.durationSeconds ?? 0) - (session.value.remainingSeconds ?? 0);
+
+  // Map to full TopicMastery shape (needs lastAttemptedAt)
+  const mapToMastery = (list: typeof weakTopics.value): TopicMastery[] =>
+    list.map((t) => ({
+      topicId: t.topicId,
+      topicPath: t.topicPath,
+      subjectId: t.subjectId,
+      totalAttempts: t.totalAttempts,
+      correctAttempts: t.correctAttempts,
+      accuracyPercent: t.accuracyPercent,
+      lastAttemptedAt: null,
+      masteryLevel: t.masteryLevel as TopicMastery['masteryLevel'],
+    }));
 
   return {
     examSessionId: session.value.id,
@@ -64,8 +77,8 @@ const summary = computed<PerformanceSummary | null>(() => {
     totalQuestions: session.value.totalQuestions,
     timeTakenSeconds,
     accuracyBadge: badgeForScore(scorePercent),
-    weakTopics: weakTopics.value,
-    strongTopics: strongTopics.value,
+    weakTopics: mapToMastery(weakTopics.value),
+    strongTopics: mapToMastery(strongTopics.value),
   };
 });
 
@@ -76,24 +89,33 @@ const formattedTimeTaken = computed(() => {
   return `${m}:${s.toString().padStart(2, '0')}`;
 });
 
-const topWeakTopics = computed<TopicMastery[]>(() => topicMastery.value.filter((t) => t.masteryLevel !== 'strong').slice(0, 5));
+const topWeakTopics = computed(() => weakTopics.value.slice(0, 5));
 
-/* -------------------------------------------------------------------------- */
-/*  Lifecycle                                                                 */
-/* -------------------------------------------------------------------------- */
+/* ── Lifecycle ──────────────────────────────────────────────────────────── */
 
 onMounted(async () => {
   isLoading.value = true;
 
-  const loadedSession = await db.exam_sessions.get(props.examSessionId);
-  session.value = loadedSession ?? null;
+  try {
+    // ── Load exam session from Firestore ──
+    const sessionSnap = await getDoc(doc(firestore, 'exam_sessions', props.examSessionId));
+    if (sessionSnap.exists()) {
+      session.value = { id: sessionSnap.id, ...sessionSnap.data() } as ExamSession;
+    }
 
-  if (loadedSession) {
-    subject.value = (await db.subjects.get(loadedSession.subjectId)) ?? null;
+    // ── Load subject from Firestore ──
+    if (session.value?.subjectId) {
+      const subjectSnap = await getDoc(doc(firestore, 'subjects', session.value.subjectId));
+      if (subjectSnap.exists()) {
+        subject.value = { id: subjectSnap.id, ...subjectSnap.data() } as Subject;
+      }
+    }
+
+    // ── Build weak-area analysis ──
+    await build();
+  } catch (err) {
+    console.error('[PerformanceDashboard] Failed to load:', err);
   }
-
-  await analyze();
-  await buildRecommendations();
 
   isLoading.value = false;
 
@@ -103,27 +125,44 @@ onMounted(async () => {
   }
 });
 
-/* -------------------------------------------------------------------------- */
-/*  Confetti celebration — scales with performance tier                       */
-/* -------------------------------------------------------------------------- */
+/* ── Confetti celebration ───────────────────────────────────────────────── */
 
 function fireConfetti(badge: PerformanceSummary['accuracyBadge']) {
   const baseOptions: confetti.Options = { origin: { y: 0.6 }, zIndex: 9999 };
 
   if (badge === 'Platinum') {
-    confetti({ ...baseOptions, particleCount: 160, spread: 100, colors: ['#2EE6B8', '#0F7A72', '#F2A93B'] });
-    setTimeout(() => confetti({ ...baseOptions, particleCount: 80, spread: 70, angle: 60 }), 250);
-    setTimeout(() => confetti({ ...baseOptions, particleCount: 80, spread: 70, angle: 120 }), 400);
+    confetti({
+      ...baseOptions,
+      particleCount: 160,
+      spread: 100,
+      colors: ['#2EE6B8', '#0F7A72', '#F2A93B'],
+    });
+    setTimeout(
+      () => confetti({ ...baseOptions, particleCount: 80, spread: 70, angle: 60 }),
+      250,
+    );
+    setTimeout(
+      () => confetti({ ...baseOptions, particleCount: 80, spread: 70, angle: 120 }),
+      400,
+    );
   } else if (badge === 'Gold') {
-    confetti({ ...baseOptions, particleCount: 120, spread: 90, colors: ['#F2A93B', '#FDECCC', '#2EE6B8'] });
+    confetti({
+      ...baseOptions,
+      particleCount: 120,
+      spread: 90,
+      colors: ['#F2A93B', '#FDECCC', '#2EE6B8'],
+    });
   } else {
-    confetti({ ...baseOptions, particleCount: 70, spread: 60, colors: ['#8AA6A2', '#0F7A72'] });
+    confetti({
+      ...baseOptions,
+      particleCount: 70,
+      spread: 60,
+      colors: ['#8AA6A2', '#0F7A72'],
+    });
   }
 }
 
-/* -------------------------------------------------------------------------- */
-/*  Shareable performance card (canvas export)                                */
-/* -------------------------------------------------------------------------- */
+/* ── Shareable performance card (canvas export) ─────────────────────────── */
 
 function drawPerformanceCard(): HTMLCanvasElement | null {
   const canvas = cardCanvasRef.value;
@@ -137,20 +176,17 @@ function drawPerformanceCard(): HTMLCanvasElement | null {
   canvas.width = width;
   canvas.height = height;
 
-  // Background gradient — brand-deep to ink, the app's signature dark panel
   const gradient = ctx.createLinearGradient(0, 0, width, height);
   gradient.addColorStop(0, '#083F3B');
   gradient.addColorStop(1, '#0B1F1E');
   ctx.fillStyle = gradient;
   ctx.fillRect(0, 0, width, height);
 
-  // Card panel
   ctx.fillStyle = '#F5F8F7';
   const pad = 60;
   roundRect(ctx, pad, pad, width - pad * 2, height - pad * 2, 32);
   ctx.fill();
 
-  // ECG pulse-line flourish
   ctx.strokeStyle = '#2EE6B8';
   ctx.lineWidth = 5;
   ctx.lineCap = 'round';
@@ -159,7 +195,8 @@ function drawPerformanceCard(): HTMLCanvasElement | null {
   const baseY = pad + 130;
   const scaleX = (width - pad * 2 - 100) / 600;
   const pts: [number, number][] = [
-    [0, 0], [130, 0], [155, 0], [170, -30], [190, 32], [208, 0], [225, 0], [245, -38], [262, 38], [280, 0], [600, 0],
+    [0, 0], [130, 0], [155, 0], [170, -30], [190, 32], [208, 0],
+    [225, 0], [245, -38], [262, 38], [280, 0], [600, 0],
   ];
   pts.forEach(([x, y], i) => {
     const px = pad + 50 + x * scaleX;
@@ -169,36 +206,30 @@ function drawPerformanceCard(): HTMLCanvasElement | null {
   });
   ctx.stroke();
 
-  // App label
   ctx.fillStyle = '#0F7A72';
   ctx.font = '600 30px "IBM Plex Mono", monospace';
   ctx.fillText('HEALTHPREP CBT', pad + 50, pad + 60);
 
-  // Subject name
   ctx.fillStyle = '#0B1F1E';
   ctx.font = 'bold 46px "Space Grotesk", sans-serif';
   wrapText(ctx, summary.value.subjectName, pad + 50, pad + 220, width - pad * 2 - 100, 54);
 
-  // Score
   ctx.fillStyle = '#083F3B';
   ctx.font = 'bold 180px "Space Grotesk", sans-serif';
   ctx.fillText(`${summary.value.scorePercent}%`, pad + 50, pad + 470);
 
-  // Badge
   ctx.fillStyle = '#F2A93B';
   ctx.font = 'bold 38px "Space Grotesk", sans-serif';
   ctx.fillText(`${summary.value.accuracyBadge.toUpperCase()} BADGE`, pad + 50, pad + 525);
 
-  // Stats row
   ctx.fillStyle = '#3E5D59';
   ctx.font = '30px "IBM Plex Mono", monospace';
   ctx.fillText(
     `${summary.value.correctCount}/${summary.value.totalQuestions} correct  •  ${formattedTimeTaken.value} taken`,
     pad + 50,
-    pad + 590
+    pad + 590,
   );
 
-  // Footer
   ctx.fillStyle = '#8AA6A2';
   ctx.font = '24px "IBM Plex Sans", sans-serif';
   ctx.fillText('Prep smarter. Prep offline. #HealthPrepCBT', pad + 50, height - pad - 40);
@@ -206,7 +237,14 @@ function drawPerformanceCard(): HTMLCanvasElement | null {
   return canvas;
 }
 
-function roundRect(ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: number, r: number) {
+function roundRect(
+  ctx: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+  r: number,
+) {
   ctx.beginPath();
   ctx.moveTo(x + r, y);
   ctx.arcTo(x + w, y, x + w, y + h, r);
@@ -216,7 +254,14 @@ function roundRect(ctx: CanvasRenderingContext2D, x: number, y: number, w: numbe
   ctx.closePath();
 }
 
-function wrapText(ctx: CanvasRenderingContext2D, text: string, x: number, y: number, maxWidth: number, lineHeight: number) {
+function wrapText(
+  ctx: CanvasRenderingContext2D,
+  text: string,
+  x: number,
+  y: number,
+  maxWidth: number,
+  lineHeight: number,
+) {
   const words = text.split(' ');
   let line = '';
   let cursorY = y;
@@ -238,7 +283,9 @@ async function shareCard() {
   if (!canvas || !summary.value) return;
 
   try {
-    const blob: Blob | null = await new Promise((resolve) => canvas.toBlob(resolve, 'image/png'));
+    const blob: Blob | null = await new Promise((resolve) =>
+      canvas.toBlob(resolve, 'image/png'),
+    );
     if (!blob) throw new Error('Could not generate image');
 
     const file = new File([blob], 'performance-card.png', { type: 'image/png' });
@@ -278,7 +325,7 @@ function downloadCard() {
 function shareToWhatsApp() {
   if (!summary.value) return;
   const text = encodeURIComponent(
-    `I scored ${summary.value.scorePercent}% on ${summary.value.subjectName} on HealthPrep CBT! 🏆`
+    `I scored ${summary.value.scorePercent}% on ${summary.value.subjectName} on HealthPrep CBT! 🏆`,
   );
   window.open(`https://wa.me/?text=${text}`, '_blank', 'noopener,noreferrer');
 }
@@ -286,7 +333,7 @@ function shareToWhatsApp() {
 function shareToTwitter() {
   if (!summary.value) return;
   const text = encodeURIComponent(
-    `I scored ${summary.value.scorePercent}% on ${summary.value.subjectName} on HealthPrep CBT! 🏆 #HealthPrepCBT`
+    `I scored ${summary.value.scorePercent}% on ${summary.value.subjectName} on HealthPrep CBT! 🏆 #HealthPrepCBT`,
   );
   window.open(`https://twitter.com/intent/tweet?text=${text}`, '_blank', 'noopener,noreferrer');
 }
@@ -298,18 +345,30 @@ function retryWeakAreas() {
 
 <template>
   <div class="min-h-screen bg-canvas py-8 px-4">
-    <div v-if="isLoading" class="max-w-2xl mx-auto text-center text-ink-300 text-sm font-mono py-20">Crunching your results…</div>
+    <div
+      v-if="isLoading"
+      class="max-w-2xl mx-auto text-center text-ink-300 text-sm font-mono py-20"
+    >
+      Crunching your results…
+    </div>
 
     <div v-else-if="summary" class="max-w-2xl mx-auto space-y-5">
       <!-- Score hero card -->
       <div class="rounded-3xl overflow-hidden shadow-panel border border-ink-100 bg-white">
-        <div class="relative p-8 text-center bg-gradient-to-br overflow-hidden" :class="badgeStyles[summary.accuracyBadge]">
+        <div
+          class="relative p-8 text-center bg-gradient-to-br overflow-hidden"
+          :class="badgeStyles[summary.accuracyBadge]"
+        >
           <div class="absolute inset-x-0 top-3 opacity-30">
             <PulseLine stroke="#ffffff" :height="40" />
           </div>
           <p class="relative text-white/90 text-sm font-medium mb-1">{{ summary.subjectName }}</p>
-          <p class="relative font-display text-white text-7xl font-bold drop-shadow-sm">{{ summary.scorePercent }}%</p>
-          <div class="relative inline-flex items-center gap-1.5 mt-3 bg-black/20 backdrop-blur rounded-full px-4 py-1.5 text-white font-semibold text-sm">
+          <p class="relative font-display text-white text-7xl font-bold drop-shadow-sm">
+            {{ summary.scorePercent }}%
+          </p>
+          <div
+            class="relative inline-flex items-center gap-1.5 mt-3 bg-black/20 backdrop-blur rounded-full px-4 py-1.5 text-white font-semibold text-sm"
+          >
             <Trophy class="w-4 h-4" />
             {{ summary.accuracyBadge }} Badge
           </div>
@@ -317,7 +376,9 @@ function retryWeakAreas() {
 
         <div class="grid grid-cols-3 divide-x divide-ink-50 border-t border-ink-50">
           <div class="p-4 text-center">
-            <p class="font-mono text-xl font-bold text-ink-900">{{ summary.correctCount }}/{{ summary.totalQuestions }}</p>
+            <p class="font-mono text-xl font-bold text-ink-900">
+              {{ summary.correctCount }}/{{ summary.totalQuestions }}
+            </p>
             <p class="text-xs text-ink-500 mt-0.5">Correct</p>
           </div>
           <div class="p-4 text-center">
@@ -356,7 +417,13 @@ function retryWeakAreas() {
             class="flex-1 min-w-[120px] rounded-xl bg-brand-700 hover:bg-brand-800 text-white text-sm font-medium py-2.5 transition-colors"
             @click="shareCard"
           >
-            {{ shareStatus === 'shared' ? 'Shared!' : shareStatus === 'copied' ? 'Copied + Saved!' : 'Share Card' }}
+            {{
+              shareStatus === 'shared'
+                ? 'Shared!'
+                : shareStatus === 'copied'
+                  ? 'Copied + Saved!'
+                  : 'Share Card'
+            }}
           </button>
           <button
             type="button"
@@ -370,7 +437,10 @@ function retryWeakAreas() {
       </div>
 
       <!-- Weak areas -->
-      <div v-if="topWeakTopics.length > 0" class="bg-white rounded-3xl border border-ink-100 shadow-card p-5">
+      <div
+        v-if="topWeakTopics.length > 0"
+        class="bg-white rounded-3xl border border-ink-100 shadow-card p-5"
+      >
         <h3 class="text-sm font-semibold text-ink-700 mb-3 flex items-center gap-1.5">
           <TrendingDown class="w-4 h-4 text-coral" /> Needs Improvement
         </h3>
@@ -383,7 +453,11 @@ function retryWeakAreas() {
             <span class="text-sm text-ink-700">{{ topic.topicPath }}</span>
             <span
               class="readout text-xs px-2.5 py-1"
-              :class="topic.masteryLevel === 'weak' ? 'bg-coral text-white' : 'bg-gold text-ink-900'"
+              :class="
+                topic.masteryLevel === 'weak'
+                  ? 'bg-coral text-white'
+                  : 'bg-gold text-ink-900'
+              "
             >
               {{ topic.accuracyPercent }}%
             </span>
@@ -399,7 +473,10 @@ function retryWeakAreas() {
       </div>
 
       <!-- Strong areas -->
-      <div v-if="summary.strongTopics.length > 0" class="bg-white rounded-3xl border border-ink-100 shadow-card p-5">
+      <div
+        v-if="summary.strongTopics.length > 0"
+        class="bg-white rounded-3xl border border-ink-100 shadow-card p-5"
+      >
         <h3 class="text-sm font-semibold text-ink-700 mb-3 flex items-center gap-1.5">
           <TrendingUp class="w-4 h-4 text-brand-500" /> Strong Areas
         </h3>
@@ -423,6 +500,8 @@ function retryWeakAreas() {
       </button>
     </div>
 
-    <div v-else class="max-w-2xl mx-auto text-center text-ink-400 text-sm py-20">Could not find this exam session.</div>
+    <div v-else class="max-w-2xl mx-auto text-center text-ink-400 text-sm py-20">
+      Could not find this exam session.
+    </div>
   </div>
 </template>

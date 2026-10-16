@@ -1,8 +1,13 @@
+<!-- src/views/HomeDashboardView.vue -->
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue';
 import { useRouter } from 'vue-router';
-import { Coins, Flame, TrendingDown, ChevronRight, BookOpen, Radio, Trophy, Medal, LogOut } from 'lucide-vue-next';
-import { db } from '../db';
+import {
+  Coins, Flame, TrendingDown, ChevronRight,
+  BookOpen, Radio, Trophy, Medal, LogOut,
+} from 'lucide-vue-next';
+import { getDoc, doc, getDocs, query, where, collection } from 'firebase/firestore';
+import { firestore } from '../firebase';
 import { useAuthStore } from '../stores/auth';
 import { useWalletAndGamificationStore } from '../stores/walletAndGamification';
 import { useLeaderboard } from '../composables/useLeaderboard';
@@ -23,15 +28,46 @@ onMounted(async () => {
     return;
   }
 
-  await wallet.initForUser(auth.userId);
-  await wallet.registerDailyLogin();
-  await refreshLeaderboard(auth.userId);
+  try {
+    await wallet.initForUser(auth.userId);
+  } catch (err) {
+    console.warn('[HomeDashboard] wallet init failed:', err);
+  }
+
+  try {
+    await wallet.registerDailyLogin();
+  } catch (err) {
+    console.warn('[HomeDashboard] daily login failed:', err);
+  }
+
+  try {
+    await refreshLeaderboard(auth.userId);
+  } catch (err) {
+    console.warn('[HomeDashboard] leaderboard failed:', err);
+  }
 
   if (auth.currentUser?.departmentId) {
-    department.value = (await db.departments.get(auth.currentUser.departmentId)) ?? null;
-    if (department.value) {
-      const loaded = await Promise.all(department.value.subjectIds.map((id) => db.subjects.get(id)));
-      subjects.value = loaded.filter((s): s is Subject => Boolean(s) && s!.isActive);
+    try {
+      const deptSnap = await getDoc(
+        doc(firestore, 'departments', auth.currentUser.departmentId),
+      );
+      department.value = deptSnap.exists()
+        ? { id: deptSnap.id, ...deptSnap.data() } as Department
+        : null;
+
+      if (department.value) {
+        const subjSnap = await getDocs(
+          query(
+            collection(firestore, 'subjects'),
+            where('departmentId', '==', department.value.id),
+          ),
+        );
+        subjects.value = subjSnap.docs
+          .map((d) => ({ id: d.id, ...d.data() }) as Subject)
+          .filter((s) => s.isActive !== false);
+      }
+    } catch (err) {
+      console.error('[HomeDashboard] Failed to load department:', err);
     }
   }
 
@@ -42,15 +78,17 @@ const topWeakTopics = computed(() => wallet.weakTopics.slice(0, 3));
 const topLeaderboardEntries = computed(() => leaderboardEntries.value.slice(0, 3));
 
 function openSubjects() {
-  if (department.value) router.push({ name: 'subjects', params: { departmentId: department.value.id } });
+  if (department.value) {
+    router.push({ name: 'subjects', params: { departmentId: department.value.id } });
+  }
 }
 
 function startSubject(subject: Subject) {
   router.push({ name: 'exam-setup', params: { subjectId: subject.id } });
 }
 
-function handleLogout() {
-  auth.logout();
+async function handleLogout() {
+  await auth.logout();
   router.replace({ name: 'login' });
 }
 
@@ -74,8 +112,7 @@ const rankStyles: Record<number, string> = {
           </div>
           <button
             type="button"
-            class="flex items-center gap-1.5 text-brand-200 text-xs font-medium
-                   hover:text-white transition-colors -mt-0.5"
+            class="flex items-center gap-1.5 text-brand-200 text-xs font-medium hover:text-white transition-colors -mt-0.5"
             @click="handleLogout"
           >
             <LogOut class="w-3.5 h-3.5" />
@@ -118,7 +155,11 @@ const rankStyles: Record<number, string> = {
           <h2 class="text-sm font-semibold text-ink-700 flex items-center gap-1.5">
             <Trophy class="w-4 h-4 text-gold" /> Leaderboard
           </h2>
-          <button type="button" class="text-xs font-semibold text-brand-600" @click="router.push({ name: 'leaderboard' })">
+          <button
+            type="button"
+            class="text-xs font-semibold text-brand-600"
+            @click="router.push({ name: 'leaderboard' })"
+          >
             View full ranking
           </button>
         </div>
@@ -136,7 +177,10 @@ const rankStyles: Record<number, string> = {
               <Medal v-if="entry.rank <= 3" class="w-3.5 h-3.5" />
               <template v-else>{{ entry.rank }}</template>
             </span>
-            <span class="flex-1 text-sm font-medium truncate" :class="entry.isCurrentUser ? 'text-brand-700' : 'text-ink-800'">
+            <span
+              class="flex-1 text-sm font-medium truncate"
+              :class="entry.isCurrentUser ? 'text-brand-700' : 'text-ink-800'"
+            >
               {{ entry.displayName }}
             </span>
             <span class="text-sm font-mono font-bold text-ink-900">{{ entry.points }}</span>
@@ -150,12 +194,20 @@ const rankStyles: Record<number, string> = {
           <h2 class="text-sm font-semibold text-ink-700 flex items-center gap-1.5">
             <TrendingDown class="w-4 h-4 text-coral" /> Needs Improvement
           </h2>
-          <button type="button" class="text-xs font-semibold text-brand-600" @click="router.push({ name: 'weak-areas' })">
+          <button
+            type="button"
+            class="text-xs font-semibold text-brand-600"
+            @click="router.push({ name: 'weak-areas' })"
+          >
             See all
           </button>
         </div>
         <div class="bg-white rounded-2xl border border-ink-100 shadow-card divide-y divide-ink-50">
-          <div v-for="topic in topWeakTopics" :key="topic.topicId" class="flex items-center justify-between px-4 py-3.5">
+          <div
+            v-for="topic in topWeakTopics"
+            :key="topic.topicId"
+            class="flex items-center justify-between px-4 py-3.5"
+          >
             <span class="text-sm text-ink-700">{{ topic.topicPath }}</span>
             <span class="readout text-xs bg-coral text-white px-2.5 py-1">{{ topic.accuracyPercent }}%</span>
           </div>
@@ -168,7 +220,9 @@ const rankStyles: Record<number, string> = {
           <h2 class="text-sm font-semibold text-ink-700 flex items-center gap-1.5">
             <BookOpen class="w-4 h-4" /> Enrolled Subjects
           </h2>
-          <button type="button" class="text-xs font-semibold text-brand-600" @click="openSubjects">Browse all</button>
+          <button type="button" class="text-xs font-semibold text-brand-600" @click="openSubjects">
+            Browse all
+          </button>
         </div>
 
         <div v-if="isLoading" class="text-sm text-ink-300 py-8 text-center">Loading…</div>

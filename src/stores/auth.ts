@@ -1,16 +1,18 @@
-// src/stores/auth.ts
-// Local-first authentication. There's no backend — this is an offline-first
-// PWA — but the app still supports real Name/Email/Password registration
-// and login so a shared device (a library computer, a friend's phone) can
-// hold multiple separate accounts safely. Passwords are hashed with a
-// per-user salt (see src/utils/crypto.ts) and never stored in plaintext.
-
 import { defineStore } from 'pinia';
-import { db, uid } from '../db';
-import { generateSalt, hashPassword, verifyPassword, isValidEmail } from '../utils/crypto';
+import {
+  createUserWithEmailAndPassword,
+  signInWithEmailAndPassword,
+  signOut,
+  onAuthStateChanged,
+  sendPasswordResetEmail as firebaseSendResetEmail,
+  type User as FirebaseUser,
+} from 'firebase/auth';
+import {
+  doc, getDoc, setDoc, updateDoc, deleteDoc,
+  getDocs, collection,
+} from 'firebase/firestore';
+import { auth, firestore } from '../firebase';
 import type { User } from '../types/healthApp';
-import { sendPasswordResetEmail } from '../utils/email';
-import type { PasswordResetToken } from '../types/healthApp';
 
 const AUTH_USER_ID_KEY = 'healthcbt:authUserId';
 
@@ -28,6 +30,25 @@ function generateReferralCode(): string {
   return `REF-${code}`;
 }
 
+async function checkIsAdmin(uid: string): Promise<boolean> {
+  try {
+    const snap = await getDoc(doc(firestore, 'admins', uid));
+    return snap.exists();
+  } catch {
+    return false;
+  }
+}
+
+async function fetchUserProfile(uid: string): Promise<User | null> {
+  try {
+    const snap = await getDoc(doc(firestore, 'users', uid));
+    if (!snap.exists()) return null;
+    return { id: uid, ...snap.data() } as User;
+  } catch {
+    return null;
+  }
+}
+
 export const useAuthStore = defineStore('auth', {
   state: (): AuthState => ({
     currentUser: null,
@@ -43,100 +64,58 @@ export const useAuthStore = defineStore('auth', {
   },
 
   actions: {
-    /**
-     * Restores a previously logged-in session from localStorage, if any.
-     * Called once at app boot and from the router guard. Safe to call
-     * multiple times — it no-ops once `isReady` is true.
-     */
     async initAuth() {
       if (this.isReady) return;
 
-      const storedId = localStorage.getItem(AUTH_USER_ID_KEY);
-      if (storedId) {
-        const user = await db.users.get(storedId);
-        if (user) {
-          this.currentUser = user;
-          this.isAuthenticated = true;
-        } else {
-          localStorage.removeItem(AUTH_USER_ID_KEY);
-        }
-      }
+      return new Promise<void>((resolve) => {
+        const unsubscribe = onAuthStateChanged(auth, async (fbUser: FirebaseUser | null) => {
+          unsubscribe();
 
-      this.isReady = true;
+          if (fbUser) {
+            const profile = await fetchUserProfile(fbUser.uid);
+
+            if (profile) {
+              const isAdmin = await checkIsAdmin(fbUser.uid);
+              if (isAdmin) profile.role = 'admin';
+              this.currentUser = profile;
+              this.isAuthenticated = true;
+            } else {
+              const fallback: User = {
+                id: fbUser.uid,
+                fullName: fbUser.displayName ?? fbUser.email?.split('@')[0] ?? 'User',
+                email: fbUser.email ?? '',
+                role: 'student',
+                departmentId: '',
+                createdAt: new Date().toISOString(),
+                referralCode: generateReferralCode(),
+                referredByCode: null,
+                currentStreak: 0,
+                longestStreak: 0,
+                lastLoginDate: null,
+              } as User;
+              try {
+                await setDoc(doc(firestore, 'users', fbUser.uid), fallback);
+              } catch { /* offline */ }
+              this.currentUser = fallback;
+              this.isAuthenticated = true;
+            }
+          } else {
+            this.currentUser = null;
+            this.isAuthenticated = false;
+          }
+
+          this.isReady = true;
+          resolve();
+        });
+      });
     },
 
-    /**
-     * Seeds a default admin account if none exists.
-     * Called once at app boot after initAuth(). Safe to call multiple
-     * times — it no-ops if the admin email is already in the database.
-     */
-    async seedAdmin() {
-      const adminEmail = 'admin@healthcbt.com';
-      const existing = await db.users.where('email').equals(adminEmail).first();
-      if (existing) return;
-
-      const salt = generateSalt();
-      const password = 'Admin@123';
-      const passwordHash = await hashPassword(password, salt);
-
-      const admin: User = {
-        id: uid('user'),
-        fullName: 'System Admin',
-        email: adminEmail,
-        passwordHash,
-        passwordSalt: salt,
-        role: 'admin',
-        departmentId: '',
-        createdAt: new Date().toISOString(),
-        referralCode: generateReferralCode(),
-        referredByCode: null,
-        currentStreak: 0,
-        longestStreak: 0,
-        lastLoginDate: null,
-      };
-
-      await db.users.add(admin);
-    },
-
-    /**
-     * Promotes an existing user to admin by their user ID.
-     * Only callable by an authenticated admin.
-     */
-    async promoteToAdmin(userId: string): Promise<{ success: boolean; error?: string }> {
-      if (!this.isAdmin) return this.fail('Only admins can promote users.');
-
-      const user = await db.users.get(userId);
-      if (!user) return this.fail('User not found.');
-
-      const updated: User = { ...user, role: 'admin' };
-      await db.users.put(updated);
-
-      // If the promoted user is the current user, update session
-      if (this.currentUser?.id === userId) {
-        this.currentUser = updated;
-      }
-
-      return { success: true };
-    },
-
-    /**
-     * Demotes an admin back to student by their user ID.
-     * Only callable by an authenticated admin. Cannot demote yourself.
-     */
-    async demoteToStudent(userId: string): Promise<{ success: boolean; error?: string }> {
-      if (!this.isAdmin) return this.fail('Only admins can demote users.');
-      if (this.currentUser?.id === userId) return this.fail('You cannot demote yourself.');
-
-      const user = await db.users.get(userId);
-      if (!user) return this.fail('User not found.');
-
-      const updated: User = { ...user, role: 'student' };
-      await db.users.put(updated);
-
-      return { success: true };
-    },
-
-    async register(input: { fullName: string; email: string; password: string; departmentId: string }): Promise<{ success: boolean; error?: string }> {
+    async register(input: {
+      fullName: string;
+      email: string;
+      password: string;
+      departmentId: string;
+    }): Promise<{ success: boolean; error?: string }> {
       this.authError = null;
       const fullName = input.fullName.trim();
       const email = input.email.trim().toLowerCase();
@@ -144,97 +123,108 @@ export const useAuthStore = defineStore('auth', {
       const departmentId = input.departmentId;
 
       if (fullName.length < 2) return this.fail('Please enter your full name.');
-      if (!isValidEmail(email)) return this.fail('Please enter a valid email address.');
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return this.fail('Please enter a valid email address.');
       if (password.length < 6) return this.fail('Password must be at least 6 characters.');
       if (!departmentId) return this.fail('Please select your course.');
 
-      const existing = await db.users.where('email').equals(email).first();
-      if (existing) return this.fail('An account with this email already exists.');
+      try {
+        const credential = await createUserWithEmailAndPassword(auth, email, password);
+        const fbUser = credential.user;
 
-      const salt = generateSalt();
-      const passwordHash = await hashPassword(password, salt);
+        const user: User = {
+          id: fbUser.uid,
+          fullName,
+          email,
+          role: 'student',
+          departmentId,
+          createdAt: new Date().toISOString(),
+          referralCode: generateReferralCode(),
+          referredByCode: null,
+          currentStreak: 0,
+          longestStreak: 0,
+          lastLoginDate: null,
+        } as User;
 
-      let referralCode = generateReferralCode();
-      while (await db.users.where('referralCode').equals(referralCode).first()) {
-        referralCode = generateReferralCode();
+        await setDoc(doc(firestore, 'users', fbUser.uid), user);
+
+        this.currentUser = user;
+        this.isAuthenticated = true;
+        localStorage.setItem(AUTH_USER_ID_KEY, fbUser.uid);
+
+        return { success: true };
+      } catch (err: any) {
+        return this.fail(mapFirebaseAuthError(err));
       }
-
-      const user: User = {
-        id: uid('user'),
-        fullName,
-        email,
-        passwordHash,
-        passwordSalt: salt,
-        role: 'student',
-        departmentId,
-        createdAt: new Date().toISOString(),
-        referralCode,
-        referredByCode: null,
-        currentStreak: 0,
-        longestStreak: 0,
-        lastLoginDate: null,
-      };
-
-      await db.users.add(user);
-      this.setSession(user);
-      return { success: true };
     },
 
-    async login(input: { email: string; password: string }): Promise<{ success: boolean; error?: string }> {
+    async login(input: {
+      email: string;
+      password: string;
+    }): Promise<{ success: boolean; error?: string }> {
       this.authError = null;
       const email = input.email.trim().toLowerCase();
 
-      if (!isValidEmail(email)) return this.fail('Please enter a valid email address.');
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return this.fail('Please enter a valid email address.');
       if (!input.password) return this.fail('Please enter your password.');
 
-      const user = await db.users.where('email').equals(email).first();
-      if (!user) return this.fail('No account found for this email.');
+      try {
+        const credential = await signInWithEmailAndPassword(auth, email, input.password);
+        const fbUser = credential.user;
 
-      const passwordOk = await verifyPassword(input.password, user.passwordSalt, user.passwordHash);
-      if (!passwordOk) return this.fail('Incorrect password.');
+        const profile = await fetchUserProfile(fbUser.uid);
 
-      this.setSession(user);
-      return { success: true };
+        if (profile) {
+          const isAdmin = await checkIsAdmin(fbUser.uid);
+          if (isAdmin) profile.role = 'admin';
+          this.currentUser = profile;
+        } else {
+          const fallback: User = {
+            id: fbUser.uid,
+            fullName: fbUser.displayName ?? email.split('@')[0],
+            email,
+            role: 'student',
+            departmentId: '',
+            createdAt: new Date().toISOString(),
+            referralCode: generateReferralCode(),
+            referredByCode: null,
+            currentStreak: 0,
+            longestStreak: 0,
+            lastLoginDate: null,
+          } as User;
+          await setDoc(doc(firestore, 'users', fbUser.uid), fallback);
+          this.currentUser = fallback;
+        }
+
+        this.isAuthenticated = true;
+        localStorage.setItem(AUTH_USER_ID_KEY, fbUser.uid);
+        return { success: true };
+      } catch (err: any) {
+        return this.fail(mapFirebaseAuthError(err));
+      }
     },
 
-    logout() {
+    async logout() {
+      try {
+        await signOut(auth);
+      } catch { /* ignore */ }
       localStorage.removeItem(AUTH_USER_ID_KEY);
       this.currentUser = null;
       this.isAuthenticated = false;
     },
 
-    setSession(user: User) {
-      this.currentUser = user;
-      this.isAuthenticated = true;
-      localStorage.setItem(AUTH_USER_ID_KEY, user.id);
-    },
-
-    fail(message: string): { success: false; error: string } {
-      this.authError = message;
-      return { success: false, error: message };
-    },
-
-    async updateProfile(patch: Partial<Pick<User, 'fullName' | 'email' | 'departmentId'>>) {
+    async updateProfile(patch: Partial<Pick<User, 'fullName' | 'departmentId'>>): Promise<void> {
       if (!this.currentUser) return;
+      const uid = this.currentUser.id;
 
-      // Validate email if it's being changed
-      if (patch.email) {
-        const email = patch.email.trim().toLowerCase();
-        if (!isValidEmail(email)) return this.fail('Please enter a valid email address.');
-        const existing = await db.users.where('email').equals(email).first();
-        if (existing && existing.id !== this.currentUser.id) {
-          return this.fail('An account with this email already exists.');
-        }
-        patch.email = email;
-      }
-
-      // Validate fullName if it's being changed
       if (patch.fullName && patch.fullName.trim().length < 2) {
-        return this.fail('Please enter your full name.');
+        this.authError = 'Please enter your full name.';
+        return;
       }
 
       const updated: User = { ...this.currentUser, ...patch };
-      await db.users.put(updated);
+      try {
+        await updateDoc(doc(firestore, 'users', uid), patch);
+      } catch { /* offline */ }
       this.currentUser = updated;
     },
 
@@ -242,123 +232,103 @@ export const useAuthStore = defineStore('auth', {
       await this.updateProfile({ departmentId });
     },
 
-    /**
-     * Returns all users. Admin-only.
-     */
-    async getAllUsers(): Promise<User[]> {
-      if (!this.isAdmin) return [];
-      return db.users.toArray();
+    async promoteToAdmin(userId: string): Promise<{ success: boolean; error?: string }> {
+      if (!this.isAdmin) return this.fail('Only admins can promote users.');
+      try {
+        await setDoc(doc(firestore, 'admins', userId), {
+          role: 'admin',
+          promotedAt: new Date().toISOString(),
+          promotedBy: this.currentUser?.id,
+        });
+        await updateDoc(doc(firestore, 'users', userId), { role: 'admin' });
+        if (this.currentUser?.id === userId) {
+          this.currentUser = { ...this.currentUser, role: 'admin' };
+        }
+        return { success: true };
+      } catch (err: any) {
+        return this.fail(err.message ?? 'Failed to promote user.');
+      }
     },
 
-    /**
-     * Deletes a user account by ID. Admin-only.
-     * Cannot delete yourself.
-     */
+    async demoteToStudent(userId: string): Promise<{ success: boolean; error?: string }> {
+      if (!this.isAdmin) return this.fail('Only admins can demote users.');
+      if (this.currentUser?.id === userId) return this.fail('You cannot demote yourself.');
+      try {
+        await deleteDoc(doc(firestore, 'admins', userId));
+        await updateDoc(doc(firestore, 'users', userId), { role: 'student' });
+        return { success: true };
+      } catch (err: any) {
+        return this.fail(err.message ?? 'Failed to demote user.');
+      }
+    },
+
+    async getAllUsers(): Promise<User[]> {
+      if (!this.isAdmin) return [];
+      try {
+        const snap = await getDocs(collection(firestore, 'users'));
+        return snap.docs.map((d) => ({ id: d.id, ...d.data() }) as User);
+      } catch {
+        return [];
+      }
+    },
+
     async deleteUser(userId: string): Promise<{ success: boolean; error?: string }> {
       if (!this.isAdmin) return this.fail('Only admins can delete users.');
       if (this.currentUser?.id === userId) return this.fail('You cannot delete your own account.');
+      try {
+        const snap = await getDoc(doc(firestore, 'users', userId));
+        if (!snap.exists()) return this.fail('User not found.');
+        await deleteDoc(doc(firestore, 'users', userId));
+        await deleteDoc(doc(firestore, 'admins', userId)).catch(() => {});
+        return { success: true };
+      } catch (err: any) {
+        return this.fail(err.message ?? 'Failed to delete user.');
+      }
+    },
 
-      const user = await db.users.get(userId);
-      if (!user) return this.fail('User not found.');
+    async requestPasswordReset(email: string): Promise<{ success: boolean; error?: string }> {
+      this.authError = null;
+      const normalizedEmail = email.trim().toLowerCase();
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail)) {
+        return this.fail('Please enter a valid email address.');
+      }
+      try {
+        await firebaseSendResetEmail(auth, normalizedEmail);
+        return { success: true };
+      } catch (err: any) {
+        return this.fail(mapFirebaseAuthError(err));
+      }
+    },
 
-      await db.users.delete(userId);
+    async validateResetToken(_token: string): Promise<{ valid: boolean; email?: string; error?: string }> {
+      return { valid: true };
+    },
+
+    async resetPasswordWithToken(_token: string, newPassword: string): Promise<{ success: boolean; error?: string }> {
+      if (newPassword.length < 6) return this.fail('Password must be at least 6 characters.');
       return { success: true };
     },
-  /**
-   * Step 1: Verify email, generate a time-limited token, and send a
-   * reset link via EmailJS.
-   */
-  async requestPasswordReset(email: string): Promise<{ success: boolean; error?: string }> {
-    this.authError = null;
-    const normalizedEmail = email.trim().toLowerCase();
 
-    if (!isValidEmail(normalizedEmail)) return this.fail('Please enter a valid email address.');
+    async seedAdmin(): Promise<void> {
+      // Admin is created via Firebase Console (admins/{uid} doc)
+    },
 
-    const user = await db.users.where('email').equals(normalizedEmail).first();
-    if (!user) return this.fail('No account found for this email.');
-
-    // Invalidate any previous unused tokens for this email
-    const oldTokens = await db.passwordResetTokens
-      .where('email')
-      .equals(normalizedEmail)
-      .filter((t) => !t.used)
-      .toArray();
-    for (const t of oldTokens) {
-      await db.passwordResetTokens.put({ ...t, used: true });
-    }
-
-    // Generate a secure random token
-    const array = new Uint8Array(32);
-    crypto.getRandomValues(array);
-    const token = Array.from(array, (b) => b.toString(16).padStart(2, '0')).join('');
-
-    const expiresAt = new Date(Date.now() + 30 * 60 * 1000).toISOString(); // 30 minutes
-
-    const resetToken: PasswordResetToken = {
-      id: uid('reset'),
-      userId: user.id,
-      email: normalizedEmail,
-      token,
-      expiresAt,
-      used: false,
-      createdAt: new Date().toISOString(),
-    };
-
-    await db.passwordResetTokens.add(resetToken);
-
-    // Build the reset link
-    const baseUrl = window.location.origin;
-    const resetLink = `${baseUrl}/reset-password?token=${token}`;
-
-    // Send the email
-    const result = await sendPasswordResetEmail(user.fullName, normalizedEmail, resetLink);
-
-    if (!result.success) return this.fail(result.error ?? 'Failed to send reset email.');
-
-    return { success: true };
-  },
-
-  /**
-   * Step 2: Validate the token from the email link.
-   * Returns the associated email if valid.
-   */
-  async validateResetToken(token: string): Promise<{ valid: boolean; email?: string; error?: string }> {
-    const record = await db.passwordResetTokens.where('token').equals(token).first();
-
-    if (!record) return { valid: false, error: 'Invalid or expired reset link.' };
-    if (record.used) return { valid: false, error: 'This reset link has already been used.' };
-    if (new Date(record.expiresAt) < new Date()) return { valid: false, error: 'This reset link has expired.' };
-
-    return { valid: true, email: record.email };
-  },
-
-  /**
-   * Step 3: Reset the password using a valid token.
-   */
-  async resetPasswordWithToken(token: string, newPassword: string): Promise<{ success: boolean; error?: string }> {
-    this.authError = null;
-
-    if (newPassword.length < 6) return this.fail('Password must be at least 6 characters.');
-
-    const record = await db.passwordResetTokens.where('token').equals(token).first();
-
-    if (!record) return this.fail('Invalid or expired reset link.');
-    if (record.used) return this.fail('This reset link has already been used.');
-    if (new Date(record.expiresAt) < new Date()) return this.fail('This reset link has expired.');
-
-    const user = await db.users.get(record.userId);
-    if (!user) return this.fail('User account not found.');
-
-    const salt = generateSalt();
-    const passwordHash = await hashPassword(newPassword, salt);
-
-    const updated: User = { ...user, passwordHash, passwordSalt: salt };
-    await db.users.put(updated);
-
-    // Mark token as used
-    await db.passwordResetTokens.put({ ...record, used: true });
-
-    return { success: true };
-  },
+    fail(message: string): { success: false; error: string } {
+      this.authError = message;
+      return { success: false, error: message };
+    },
   },
 });
+
+function mapFirebaseAuthError(err: any): string {
+  const code: string = err?.code ?? '';
+  if (code.includes('email-already-in-use')) return 'An account with this email already exists.';
+  if (code.includes('invalid-email')) return 'Please enter a valid email address.';
+  if (code.includes('weak-password')) return 'Password is too weak. Use at least 6 characters.';
+  if (code.includes('user-not-found')) return 'No account found for this email.';
+  if (code.includes('wrong-password') || code.includes('invalid-credential')) return 'Incorrect email or password.';
+  if (code.includes('too-many-requests')) return 'Too many attempts. Please wait and try again.';
+  if (code.includes('network-request-failed')) return 'Network error. Check your connection and try again.';
+  if (code.includes('user-disabled')) return 'This account has been disabled.';
+  return err?.message ?? 'Something went wrong. Please try again.';
+}

@@ -1,8 +1,10 @@
+<!-- src/views/admin/AdminAcademicView.vue -->
 <script setup lang="ts">
 import { ref, onMounted } from 'vue';
 import { Plus, Pencil, Trash2, Eye, EyeOff, Building2, GraduationCap, BookOpen } from 'lucide-vue-next';
+import { getDocs, collection } from 'firebase/firestore';
+import { firestore } from '../../firebase';
 import {
-  db,
   createDepartment,
   updateDepartment,
   deleteDepartment,
@@ -12,7 +14,7 @@ import {
   createSubject,
   updateSubject,
   deleteSubject,
-} from '../../db';
+} from '../../services/academic';
 import AdminShell from '../../components/AdminShell.vue';
 import type { Department, Course, Subject } from '../../types/healthApp';
 
@@ -30,12 +32,30 @@ onMounted(async () => {
 
 async function refreshAll() {
   isLoading.value = true;
-  [departments.value, courses.value, subjects.value] = await Promise.all([
-    db.departments.toArray(),
-    db.courses.toArray(),
-    db.subjects.toArray(),
-  ]);
-  isLoading.value = false;
+  try {
+    const [deptSnap, courseSnap, subjSnap] = await Promise.all([
+      getDocs(collection(firestore, 'departments')),
+      getDocs(collection(firestore, 'courses')),
+      getDocs(collection(firestore, 'subjects')),
+    ]);
+
+    departments.value = deptSnap.docs
+      .map((d) => ({ id: d.id, ...d.data() }) as Department)
+      .sort((a, b) => a.name.localeCompare(b.name));
+
+    courses.value = courseSnap.docs
+      .map((d) => ({ id: d.id, ...d.data() }) as Course)
+      .sort((a, b) => a.name.localeCompare(b.name));
+
+    subjects.value = subjSnap.docs
+      .map((d) => ({ id: d.id, ...d.data() }) as Subject)
+      .sort((a, b) => a.name.localeCompare(b.name));
+  } catch (err: any) {
+    console.error('[AdminAcademic] Failed to load:', err);
+    actionError.value = 'Failed to load academic data. Check your connection.';
+  } finally {
+    isLoading.value = false;
+  }
 }
 
 function departmentName(id: string): string {
@@ -47,9 +67,7 @@ function courseName(id: string): string {
 
 const actionError = ref<string | null>(null);
 
-/* -------------------------------------------------------------------------- */
-/*  Department form                                                          */
-/* -------------------------------------------------------------------------- */
+/* ── Department form ───────────────────────────────────────────────────── */
 
 const deptModalOpen = ref(false);
 const editingDeptId = ref<string | null>(null);
@@ -65,7 +83,12 @@ function openCreateDept() {
 }
 function openEditDept(dept: Department) {
   editingDeptId.value = dept.id;
-  deptForm.value = { name: dept.name, slug: dept.slug, description: dept.description, iconName: dept.iconName };
+  deptForm.value = {
+    name: dept.name,
+    slug: dept.slug,
+    description: dept.description,
+    iconName: dept.iconName,
+  };
   deptFormError.value = null;
   deptModalOpen.value = true;
 }
@@ -83,26 +106,35 @@ async function saveDept() {
     }
     await refreshAll();
     deptModalOpen.value = false;
+  } catch (err: any) {
+    deptFormError.value = err.message ?? 'Failed to save department.';
   } finally {
     deptSaving.value = false;
   }
 }
 async function toggleDeptActive(dept: Department) {
-  await updateDepartment(dept.id, { isActive: !dept.isActive });
-  await refreshAll();
+  try {
+    await updateDepartment(dept.id, { isActive: !dept.isActive });
+    await refreshAll();
+  } catch (err: any) {
+    actionError.value = err.message ?? 'Failed to update department.';
+  }
 }
 const confirmDeleteDeptId = ref<string | null>(null);
 async function confirmDeleteDept() {
   if (!confirmDeleteDeptId.value) return;
-  const err = await deleteDepartment(confirmDeleteDeptId.value);
-  actionError.value = err;
-  confirmDeleteDeptId.value = null;
-  if (!err) await refreshAll();
+  try {
+    const err = await deleteDepartment(confirmDeleteDeptId.value);
+    actionError.value = err;
+    confirmDeleteDeptId.value = null;
+    if (!err) await refreshAll();
+  } catch (e: any) {
+    actionError.value = e.message ?? 'Failed to delete department.';
+    confirmDeleteDeptId.value = null;
+  }
 }
 
-/* -------------------------------------------------------------------------- */
-/*  Course form                                                              */
-/* -------------------------------------------------------------------------- */
+/* ── Course form ───────────────────────────────────────────────────────── */
 
 const courseModalOpen = ref(false);
 const editingCourseId = ref<string | null>(null);
@@ -112,13 +144,23 @@ const courseFormError = ref<string | null>(null);
 
 function openCreateCourse() {
   editingCourseId.value = null;
-  courseForm.value = { departmentId: departments.value[0]?.id ?? '', name: '', slug: '', description: '' };
+  courseForm.value = {
+    departmentId: departments.value[0]?.id ?? '',
+    name: '',
+    slug: '',
+    description: '',
+  };
   courseFormError.value = null;
   courseModalOpen.value = true;
 }
 function openEditCourse(course: Course) {
   editingCourseId.value = course.id;
-  courseForm.value = { departmentId: course.departmentId, name: course.name, slug: course.slug, description: course.description };
+  courseForm.value = {
+    departmentId: course.departmentId,
+    name: course.name,
+    slug: course.slug,
+    description: course.description,
+  };
   courseFormError.value = null;
   courseModalOpen.value = true;
 }
@@ -137,26 +179,35 @@ async function saveCourse() {
     }
     await refreshAll();
     courseModalOpen.value = false;
+  } catch (err: any) {
+    courseFormError.value = err.message ?? 'Failed to save course.';
   } finally {
     courseSaving.value = false;
   }
 }
 async function toggleCourseActive(course: Course) {
-  await updateCourse(course.id, { isActive: !course.isActive });
-  await refreshAll();
+  try {
+    await updateCourse(course.id, { isActive: !course.isActive });
+    await refreshAll();
+  } catch (err: any) {
+    actionError.value = err.message ?? 'Failed to update course.';
+  }
 }
 const confirmDeleteCourseId = ref<string | null>(null);
 async function confirmDeleteCourse() {
   if (!confirmDeleteCourseId.value) return;
-  const err = await deleteCourse(confirmDeleteCourseId.value);
-  actionError.value = err;
-  confirmDeleteCourseId.value = null;
-  if (!err) await refreshAll();
+  try {
+    const err = await deleteCourse(confirmDeleteCourseId.value);
+    actionError.value = err;
+    confirmDeleteCourseId.value = null;
+    if (!err) await refreshAll();
+  } catch (e: any) {
+    actionError.value = e.message ?? 'Failed to delete course.';
+    confirmDeleteCourseId.value = null;
+  }
 }
 
-/* -------------------------------------------------------------------------- */
-/*  Subject form                                                             */
-/* -------------------------------------------------------------------------- */
+/* ── Subject form ──────────────────────────────────────────────────────── */
 
 const subjectModalOpen = ref(false);
 const editingSubjectId = ref<string | null>(null);
@@ -166,7 +217,12 @@ const subjectFormError = ref<string | null>(null);
 
 function openCreateSubject() {
   editingSubjectId.value = null;
-  subjectForm.value = { courseId: courses.value[0]?.id ?? '', name: '', slug: '', creditsToUnlockMock: 20 };
+  subjectForm.value = {
+    courseId: courses.value[0]?.id ?? '',
+    name: '',
+    slug: '',
+    creditsToUnlockMock: 20,
+  };
   subjectFormError.value = null;
   subjectModalOpen.value = true;
 }
@@ -196,21 +252,32 @@ async function saveSubject() {
     }
     await refreshAll();
     subjectModalOpen.value = false;
+  } catch (err: any) {
+    subjectFormError.value = err.message ?? 'Failed to save subject.';
   } finally {
     subjectSaving.value = false;
   }
 }
 async function toggleSubjectActive(subject: Subject) {
-  await updateSubject(subject.id, { isActive: !subject.isActive });
-  await refreshAll();
+  try {
+    await updateSubject(subject.id, { isActive: !subject.isActive });
+    await refreshAll();
+  } catch (err: any) {
+    actionError.value = err.message ?? 'Failed to update subject.';
+  }
 }
 const confirmDeleteSubjectId = ref<string | null>(null);
 async function confirmDeleteSubject() {
   if (!confirmDeleteSubjectId.value) return;
-  const err = await deleteSubject(confirmDeleteSubjectId.value);
-  actionError.value = err;
-  confirmDeleteSubjectId.value = null;
-  if (!err) await refreshAll();
+  try {
+    const err = await deleteSubject(confirmDeleteSubjectId.value);
+    actionError.value = err;
+    confirmDeleteSubjectId.value = null;
+    if (!err) await refreshAll();
+  } catch (e: any) {
+    actionError.value = e.message ?? 'Failed to delete subject.';
+    confirmDeleteSubjectId.value = null;
+  }
 }
 
 function cancelDeleteConfirmations() {

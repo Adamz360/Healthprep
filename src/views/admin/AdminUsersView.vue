@@ -1,9 +1,12 @@
+<!-- src/views/admin/AdminUsersView.vue -->
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue';
 import { Search, Coins, ShieldCheck, GraduationCap, Plus, Minus } from 'lucide-vue-next';
-import { db, uid, ensureWalletExists } from '../../db';
+import { doc, setDoc, getDocs, collection } from 'firebase/firestore';
+import { firestore } from '../../firebase';
+import { uid } from '../../db/schema';
 import AdminShell from '../../components/AdminShell.vue';
-import type { User, Department, Wallet } from '../../types/healthApp';
+import type { User, Department, Wallet, WalletTransaction } from '../../types/healthApp';
 
 interface UserRow {
   user: User;
@@ -23,31 +26,76 @@ onMounted(async () => {
   await loadUsers();
 });
 
+
 async function loadUsers() {
   isLoading.value = true;
-  const [users, departments] = await Promise.all([db.users.toArray(), db.departments.toArray()]);
-  const deptById = new Map<string, Department>(departments.map((d) => [d.id, d]));
 
-  const built: UserRow[] = [];
-  for (const user of users) {
-    const wallet = await ensureWalletExists(user.id);
-    built.push({
-      user,
-      departmentName: deptById.get(user.departmentId)?.name ?? '—',
-      wallet,
+  try {
+    const [usersSnap, deptsSnap, walletsSnap] = await Promise.all([
+      getDocs(collection(firestore, 'users')),
+      getDocs(collection(firestore, 'departments')),
+      getDocs(collection(firestore, 'wallets')),
+    ]);
+
+    console.log('[AdminUsers] Users found:', usersSnap.size);
+    console.log('[AdminUsers] Departments found:', deptsSnap.size);
+    console.log('[AdminUsers] Wallets found:', walletsSnap.size);
+
+    usersSnap.docs.forEach((d) => {
+      console.log('  → User:', d.id, d.data().fullName, d.data().email);
     });
-  }
 
-  // Newest accounts first
-  built.sort((a, b) => (a.user.createdAt < b.user.createdAt ? 1 : -1));
-  rows.value = built;
-  isLoading.value = false;
+    const departments = deptsSnap.docs.map((d) => ({ id: d.id, ...d.data() }) as Department);
+    const deptById = new Map<string, Department>(departments.map((d) => [d.id, d]));
+
+    const walletById = new Map<string, Wallet>(
+      walletsSnap.docs.map((d) => [d.id, d.data() as Wallet]),
+    );
+
+    const built: UserRow[] = [];
+    for (const userDoc of usersSnap.docs) {
+      const user = { id: userDoc.id, ...userDoc.data() } as User;
+
+      let wallet = walletById.get(user.id);
+      if (!wallet) {
+        wallet = {
+          userId: user.id,
+          balance: 50,
+          totalEarned: 50,
+          totalSpent: 0,
+          updatedAt: new Date().toISOString(),
+        };
+        await setDoc(doc(firestore, 'wallets', user.id), wallet);
+      }
+
+      built.push({
+        user,
+        departmentName: deptById.get(user.departmentId)?.name ?? '—',
+        wallet,
+      });
+    }
+
+    built.sort((a, b) => (a.user.createdAt < b.user.createdAt ? 1 : -1));
+    rows.value = built;
+    console.log('[AdminUsers] Rows built:', rows.value.length);
+  } catch (err: any) {
+    console.error('[AdminUsers] ERROR:', err.code, err.message);
+    if (err.code === 'permission-denied') {
+      console.error('[AdminUsers] → Make sure admins/{your-uid} doc exists in Firestore!');
+    }
+  } finally {
+    isLoading.value = false;
+  }
 }
 
 const filteredRows = computed(() => {
   const q = searchQuery.value.trim().toLowerCase();
   if (!q) return rows.value;
-  return rows.value.filter((r) => r.user.fullName.toLowerCase().includes(q) || r.user.email.toLowerCase().includes(q));
+  return rows.value.filter(
+    (r) =>
+      r.user.fullName.toLowerCase().includes(q) ||
+      r.user.email.toLowerCase().includes(q),
+  );
 });
 
 function openAdjust(userId: string) {
@@ -79,21 +127,24 @@ async function applyAdjustment(direction: 1 | -1) {
       updatedAt: new Date().toISOString(),
     };
 
-    await db.transaction('rw', db.wallet, db.wallet_transactions, async () => {
-      await db.wallet.put(updatedWallet);
-      await db.wallet_transactions.add({
-        id: uid('tx'),
-        userId: row.user.id,
-        type: direction > 0 ? 'earned-quiz' : 'spent-mock-unlock',
-        amount: actualDelta,
-        balanceAfter: newBalance,
-        description: `Admin adjustment: ${direction > 0 ? '+' : ''}${actualDelta} credits`,
-        createdAt: new Date().toISOString(),
-      });
-    });
+    // Write to Firestore
+    await setDoc(doc(firestore, 'wallets', row.user.id), updatedWallet);
+
+    const tx: WalletTransaction = {
+      id: uid('tx'),
+      userId: row.user.id,
+      type: direction > 0 ? 'earned-quiz' : 'spent-mock-unlock',
+      amount: actualDelta,
+      balanceAfter: newBalance,
+      description: `Admin adjustment: ${direction > 0 ? '+' : ''}${actualDelta} credits`,
+      createdAt: new Date().toISOString(),
+    };
+    await setDoc(doc(firestore, 'wallet_transactions', tx.id), tx);
 
     row.wallet = updatedWallet;
     closeAdjust();
+  } catch (err: any) {
+    console.error('[AdminUsers] Failed to adjust credits:', err);
   } finally {
     isSavingAdjustment.value = false;
   }

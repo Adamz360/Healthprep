@@ -1,8 +1,14 @@
+<!-- src/views/SubjectListView.vue -->
 <script setup lang="ts">
 import { ref, onMounted } from 'vue';
 import { useRouter } from 'vue-router';
 import { ChevronLeft, ChevronRight, Download, CheckCircle2 } from 'lucide-vue-next';
-import { db, ensureSubjectDownloaded } from '../db';
+import {
+  getDoc, getDocs, doc,
+  collection, query, where,
+} from 'firebase/firestore';
+import { firestore } from '../firebase';
+import { ensureSubjectDownloaded } from '../services/academic';
 import type { Department, Subject } from '../types/healthApp';
 
 const props = defineProps<{ departmentId: string }>();
@@ -14,22 +20,45 @@ const isLoading = ref(true);
 const downloadingId = ref<string | null>(null);
 
 onMounted(async () => {
-  department.value = (await db.departments.get(props.departmentId)) ?? null;
-  if (department.value) {
-    const loaded = await Promise.all(department.value.subjectIds.map((id) => db.subjects.get(id)));
-    subjects.value = loaded.filter((s): s is Subject => Boolean(s) && s!.isActive);
+  try {
+    // Load department from Firestore
+    const deptSnap = await getDoc(doc(firestore, 'departments', props.departmentId));
+    department.value = deptSnap.exists()
+      ? { id: deptSnap.id, ...deptSnap.data() } as Department
+      : null;
+
+    if (department.value) {
+      // Load subjects for this department
+      const subjSnap = await getDocs(
+        query(
+          collection(firestore, 'subjects'),
+          where('departmentId', '==', department.value.id),
+        ),
+      );
+      subjects.value = subjSnap.docs
+        .map((d) => ({ id: d.id, ...d.data() }) as Subject)
+        .filter((s) => s.isActive !== false);
+    }
+  } catch (err) {
+    console.error('[SubjectList] Failed to load:', err);
+  } finally {
+    isLoading.value = false;
   }
-  isLoading.value = false;
 });
 
 async function downloadSubject(subject: Subject) {
   downloadingId.value = subject.id;
-  const updated = await ensureSubjectDownloaded(subject.id);
-  if (updated) {
-    const idx = subjects.value.findIndex((s) => s.id === subject.id);
-    if (idx !== -1) subjects.value[idx] = updated;
+  try {
+    const updated = await ensureSubjectDownloaded(subject.id);
+    if (updated) {
+      const idx = subjects.value.findIndex((s) => s.id === subject.id);
+      if (idx !== -1) subjects.value[idx] = updated;
+    }
+  } catch (err) {
+    console.error('[SubjectList] Download failed:', err);
+  } finally {
+    downloadingId.value = null;
   }
-  downloadingId.value = null;
 }
 
 function openSubject(subject: Subject) {

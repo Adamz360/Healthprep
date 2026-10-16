@@ -1,3 +1,4 @@
+<!-- src/views/admin/AdminDashboardView.vue -->
 <script setup lang="ts">
 import { ref, onMounted } from 'vue';
 import { useRouter } from 'vue-router';
@@ -15,7 +16,7 @@ import {
   CheckCircle2,
   Landmark,
 } from 'lucide-vue-next';
-import { computeAdminStats, getRecentActivity } from '../../db';
+import { computeAdminStats, getRecentActivity } from '../../services/wallet';
 import AdminShell from '../../components/AdminShell.vue';
 import type { AdminStats, RecentActivityItem } from '../../types/healthApp';
 
@@ -25,10 +26,18 @@ const recentActivity = ref<RecentActivityItem[]>([]);
 const isLoading = ref(true);
 
 onMounted(async () => {
-  const [statsResult, activityResult] = await Promise.all([computeAdminStats(), getRecentActivity(8)]);
-  stats.value = statsResult;
-  recentActivity.value = activityResult;
-  isLoading.value = false;
+  try {
+    const [statsResult, activityResult] = await Promise.all([
+      computeAdminStats(),
+      getRecentActivity(8),
+    ]);
+    stats.value = statsResult;
+    recentActivity.value = activityResult;
+  } catch (err: any) {
+    console.error('[AdminDashboard] Failed to load stats:', err);
+  } finally {
+    isLoading.value = false;
+  }
 });
 
 const statCards = [

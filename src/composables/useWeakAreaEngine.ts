@@ -1,197 +1,140 @@
 // src/composables/useWeakAreaEngine.ts
-// Analyzes historical IndexedDB test responses to extract weak topics and
-// suggest targeted practice quizzes + revision videos.
+import { ref, computed } from 'vue';
+import { getDocs, getDoc, collection, doc, query, where } from 'firebase/firestore';
+import { firestore } from '../firebase';
+import { db as localDb } from '../db/schema';
 
-import { ref, computed, type Ref } from 'vue';
-import { db } from '../db';
-import type { TopicMastery, WeakAreaRecommendation, UserResponse } from '../types/healthApp';
+export interface TopicMasteryEntry {
+  topicId: string;
+  topicPath: string;
+  subjectId: string;
+  totalAttempts: number;
+  correctAttempts: number;
+  accuracyPercent: number;
+  masteryLevel: string;
+}
 
-/* -------------------------------------------------------------------------- */
-/*  Tunables                                                                   */
-/* -------------------------------------------------------------------------- */
+export interface WeakAreaRecommendation {
+  topicId: string;
+  topicPath: string;
+  subjectId: string;
+  accuracyPercent: number;
+  masteryLevel: string;
+  recommendedQuestionCount: number;
+  recommendedVideoIds: string[];
+}
 
-const WEAK_THRESHOLD = 50; // accuracy % below this => "weak"
-const DEVELOPING_THRESHOLD = 75; // accuracy % below this (and >= WEAK) => "developing"
-const MIN_ATTEMPTS_FOR_CONFIDENCE = 3; // don't flag a topic weak on 1 lucky/unlucky guess
-const RECOMMENDED_QUESTIONS_PER_TOPIC = 10;
-
-/* -------------------------------------------------------------------------- */
-/*  Composable                                                                 */
-/* -------------------------------------------------------------------------- */
-
-export function useWeakAreaEngine(userId: Ref<string | null> | string | null) {
-  const isAnalyzing = ref(false);
-  const error = ref<string | null>(null);
-  const topicMastery = ref<TopicMastery[]>([]);
+export function useWeakAreaEngine(userId: string | null) {
   const recommendations = ref<WeakAreaRecommendation[]>([]);
+  const topicMastery = ref<TopicMasteryEntry[]>([]);
+  const isLoading = ref(true);
 
-  function resolveUserId(): string | null {
-    return typeof userId === 'string' || userId === null ? userId : userId.value;
-  }
-
-  const weakTopics = computed(() => topicMastery.value.filter((t) => t.masteryLevel === 'weak'));
-  const developingTopics = computed(() => topicMastery.value.filter((t) => t.masteryLevel === 'developing'));
-  const strongTopics = computed(() => topicMastery.value.filter((t) => t.masteryLevel === 'strong'));
+  const weakTopics = computed(() =>
+    topicMastery.value.filter((t) => t.masteryLevel !== 'strong'),
+  );
+  const strongTopics = computed(() =>
+    topicMastery.value.filter((t) => t.masteryLevel === 'strong'),
+  );
+  const hasWeakAreas = computed(() => recommendations.value.length > 0);
 
   const overallAccuracyPercent = computed(() => {
-    const total = topicMastery.value.reduce((sum, t) => sum + t.totalAttempts, 0);
-    const correct = topicMastery.value.reduce((sum, t) => sum + t.correctAttempts, 0);
+    const all = topicMastery.value;
+    if (all.length === 0) return 0;
+    const total = all.reduce((s: number, t: TopicMasteryEntry) => s + t.totalAttempts, 0);
+    const correct = all.reduce((s: number, t: TopicMasteryEntry) => s + t.correctAttempts, 0);
     return total > 0 ? Math.round((correct / total) * 100) : 0;
   });
 
-  /**
-   * Classifies mastery level, but treats low-attempt topics as "developing"
-   * at worst — we shouldn't scare a student with "weak" off a single miss.
-   */
-  function classify(accuracyPercent: number, totalAttempts: number): TopicMastery['masteryLevel'] {
-    if (totalAttempts < MIN_ATTEMPTS_FOR_CONFIDENCE) {
-      return accuracyPercent < WEAK_THRESHOLD ? 'developing' : 'strong';
+  async function build() {
+    if (!userId) {
+      isLoading.value = false;
+      return;
     }
-    if (accuracyPercent < WEAK_THRESHOLD) return 'weak';
-    if (accuracyPercent < DEVELOPING_THRESHOLD) return 'developing';
-    return 'strong';
-  }
+    isLoading.value = true;
 
-  /**
-   * Pulls every graded response for the user from IndexedDB and aggregates
-   * accuracy per topic.
-   */
-  async function analyze(): Promise<TopicMastery[]> {
-    const uidVal = resolveUserId();
-    if (!uidVal) {
-      topicMastery.value = [];
-      return [];
-    }
-
-    isAnalyzing.value = true;
-    error.value = null;
+    // Gather responses from Firestore + local cache
+    let responses: any[] = [];
+    try {
+      const snap = await getDocs(
+        query(collection(firestore, 'user_responses'), where('userId', '==', userId)),
+      );
+      responses = snap.docs.map((d) => d.data());
+    } catch { /* offline */ }
 
     try {
-      const responses: UserResponse[] = await db.user_responses
-        .where('userId')
-        .equals(uidVal)
-        .and((r) => r.isCorrect !== null)
-        .toArray();
+      const local = await localDb.user_responses.where('userId').equals(userId).toArray();
+      const ids = new Set(responses.map((r) => r.id));
+      for (const lr of local) if (!ids.has(lr.id)) responses.push(lr);
+    } catch { /* no cache */ }
 
-      const byTopic = new Map<
-        string,
-        { subjectId: string; total: number; correct: number; lastAt: string | null }
-      >();
+    responses = responses.filter((r: any) => r.isCorrect !== null && r.isCorrect !== undefined);
 
-      for (const r of responses) {
-        const agg = byTopic.get(r.topicId) ?? { subjectId: r.subjectId, total: 0, correct: 0, lastAt: null };
-        agg.total += 1;
-        if (r.isCorrect) agg.correct += 1;
-        if (r.answeredAt && (!agg.lastAt || r.answeredAt > agg.lastAt)) agg.lastAt = r.answeredAt;
-        byTopic.set(r.topicId, agg);
-      }
+    // Aggregate by topic
+    const byTopic = new Map<string, { subjectId: string; total: number; correct: number }>();
+    for (const r of responses) {
+      const entry = byTopic.get(r.topicId) ?? { subjectId: r.subjectId, total: 0, correct: 0 };
+      entry.total += 1;
+      if (r.isCorrect) entry.correct += 1;
+      byTopic.set(r.topicId, entry);
+    }
 
-      const results: TopicMastery[] = [];
-      for (const [topicId, agg] of byTopic.entries()) {
-        const topic = await db.topics.get(topicId);
-        const accuracyPercent = agg.total > 0 ? Math.round((agg.correct / agg.total) * 100) : 0;
-        results.push({
-          topicId,
-          topicPath: topic?.parentTopicPath ?? 'Unknown Topic',
-          subjectId: agg.subjectId,
-          totalAttempts: agg.total,
-          correctAttempts: agg.correct,
+    // Build mastery + weak recommendations
+    const mastery: TopicMasteryEntry[] = [];
+    const recs: WeakAreaRecommendation[] = [];
+
+    for (const [topicId, agg] of byTopic.entries()) {
+      const accuracyPercent = agg.total > 0 ? Math.round((agg.correct / agg.total) * 100) : 0;
+      const level = accuracyPercent < 50 ? 'weak' : accuracyPercent < 75 ? 'developing' : 'strong';
+
+      let topicPath = 'Unknown Topic';
+      try {
+        const snap = await getDoc(doc(firestore, 'topics', topicId));
+        if (snap.exists()) topicPath = (snap.data() as any).parentTopicPath ?? topicPath;
+      } catch { /* offline */ }
+
+      mastery.push({
+        topicId, topicPath, subjectId: agg.subjectId,
+        totalAttempts: agg.total, correctAttempts: agg.correct,
+        accuracyPercent, masteryLevel: level,
+      });
+
+      if (accuracyPercent < 50) {
+        let questionCount = 0;
+        try {
+          const qSnap = await getDocs(
+            query(collection(firestore, 'questions'), where('topicId', '==', topicId)),
+          );
+          questionCount = qSnap.size;
+        } catch { /* offline */ }
+
+        recs.push({
+          topicId, topicPath, subjectId: agg.subjectId,
           accuracyPercent,
-          lastAttemptedAt: agg.lastAt,
-          masteryLevel: classify(accuracyPercent, agg.total),
+          masteryLevel: accuracyPercent < 30 ? 'critical' : 'weak',
+          recommendedQuestionCount: Math.min(questionCount, 10),
+          recommendedVideoIds: [],
         });
       }
-
-      // Weakest first so the dashboard widget can just take(N)
-      topicMastery.value = results.sort((a, b) => a.accuracyPercent - b.accuracyPercent);
-      return topicMastery.value;
-    } catch (err) {
-      error.value = err instanceof Error ? err.message : 'Failed to analyze performance history';
-      return [];
-    } finally {
-      isAnalyzing.value = false;
-    }
-  }
-
-  /**
-   * Builds concrete, actionable recommendations for each weak topic:
-   * a fresh batch of practice questions the user hasn't necessarily seen
-   * before, plus any linked revision videos for that topic.
-   */
-  async function buildRecommendations(limitTopics = 5): Promise<WeakAreaRecommendation[]> {
-    const uidVal = resolveUserId();
-    if (!uidVal) {
-      recommendations.value = [];
-      return [];
     }
 
-    const targets = weakTopics.value.length > 0 ? weakTopics.value : developingTopics.value;
-    const chosen = targets.slice(0, limitTopics);
-
-    const built: WeakAreaRecommendation[] = [];
-
-    for (const topic of chosen) {
-      const candidateQuestions = await db.questions
-        .where('topicId')
-        .equals(topic.topicId)
-        .toArray();
-
-      const previouslySeenIds = new Set(
-        (
-          await db.user_responses
-            .where('userId')
-            .equals(uidVal)
-            .and((r) => r.topicId === topic.topicId)
-            .toArray()
-        ).map((r) => r.questionId)
-      );
-
-      // Prefer unseen questions first, then fall back to seen ones so we
-      // always have something to recommend even on a small question bank.
-      const unseen = candidateQuestions.filter((q) => !previouslySeenIds.has(q.id));
-      const seen = candidateQuestions.filter((q) => previouslySeenIds.has(q.id));
-      const orderedQuestionIds = [...unseen, ...seen].slice(0, RECOMMENDED_QUESTIONS_PER_TOPIC).map((q) => q.id);
-
-      const videos = await db.videos.where('topicId').equals(topic.topicId).toArray();
-
-      built.push({
-        topic,
-        recommendedQuestionIds: orderedQuestionIds,
-        recommendedVideoIds: videos.map((v) => v.id),
-        reason:
-          topic.masteryLevel === 'weak'
-            ? `Only ${topic.accuracyPercent}% accuracy across ${topic.totalAttempts} attempts on "${topic.topicPath}" — prioritize this topic.`
-            : `${topic.accuracyPercent}% accuracy on "${topic.topicPath}" — a bit more practice will lock this in.`,
-      });
-    }
-
-    recommendations.value = built;
-    return built;
+    topicMastery.value = mastery.sort((a, b) => a.accuracyPercent - b.accuracyPercent);
+    recommendations.value = recs.sort((a, b) => a.accuracyPercent - b.accuracyPercent);
+    isLoading.value = false;
   }
 
-  /**
-   * Convenience: runs analyze() then buildRecommendations() in one call,
-   * as the dashboard widget typically wants both at once.
-   */
-  async function refreshAll(limitTopics = 5) {
-    await analyze();
-    await buildRecommendations(limitTopics);
-  }
+  async function analyze() { await build(); }
+  async function buildRecommendations() { await build(); }
 
   return {
-    // state
-    isAnalyzing,
-    error,
-    topicMastery,
     recommendations,
-    // derived
+    topicMastery,
+    isLoading,
+    hasWeakAreas,
     weakTopics,
-    developingTopics,
     strongTopics,
     overallAccuracyPercent,
-    // actions
+    build,
     analyze,
     buildRecommendations,
-    refreshAll,
   };
 }

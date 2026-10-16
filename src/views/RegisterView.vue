@@ -3,7 +3,8 @@ import { ref, computed, onMounted } from 'vue';
 import { useRouter } from 'vue-router';
 import { Eye, EyeOff, UserPlus, AlertCircle, GraduationCap } from 'lucide-vue-next';
 import { useAuthStore } from '../stores/auth';
-import { db } from '../db';
+import { collection, getDocs } from 'firebase/firestore';
+import { firestore } from '../firebase';
 import PulseLine from '../components/PulseLine.vue';
 import type { Department } from '../types/healthApp';
 
@@ -22,9 +23,27 @@ const errorMessage = ref<string | null>(null);
 const departments = ref<Department[]>([]);
 const isLoadingDepartments = ref(true);
 
+
 onMounted(async () => {
-  departments.value = await db.departments.toArray();
-  isLoadingDepartments.value = false;
+  try {
+    // ★ FIRESTORE directly — NOT local Dexie
+    const snap = await getDocs(collection(firestore, 'departments'));
+    departments.value = snap.docs
+      .map((d) => ({ id: d.id, ...d.data() } as Department))
+      .filter((d) => d.isActive !== false)
+      .sort((a, b) => a.name.localeCompare(b.name));
+
+    console.log('Departments loaded:', departments.value.length);
+
+    if (departments.value.length === 0) {
+      errorMessage.value = 'No courses available yet. Please contact support.';
+    }
+  } catch (err: any) {
+    console.error('[RegisterView] Firestore error:', err.code, err.message);
+    errorMessage.value = 'Could not load courses. Check your connection and try again.';
+  } finally {
+    isLoadingDepartments.value = false;
+  }
 });
 
 const passwordsMatch = computed(() => password.value === confirmPassword.value);

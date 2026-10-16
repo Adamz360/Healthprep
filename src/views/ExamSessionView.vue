@@ -3,7 +3,8 @@ import { useRouter } from 'vue-router';
 import { useAuthStore } from '../stores/auth';
 import { useWalletAndGamificationStore } from '../stores/walletAndGamification';
 import CbtExamView from '../components/CbtExamView.vue';
-import { db } from '../db';
+import { getDoc, doc } from 'firebase/firestore';
+import { firestore } from '../firebase';
 import type { ExamSession } from '../types/healthApp';
 
 const props = defineProps<{ examSessionId: string }>();
@@ -12,11 +13,18 @@ const auth = useAuthStore();
 const wallet = useWalletAndGamificationStore();
 
 async function handleSubmitted(finishedSession: ExamSession) {
-  // Reward quiz completion (credits) and refresh weak-area analytics before
-  // handing off to the results screen.
-  const subject = await db.subjects.get(finishedSession.subjectId);
-  await wallet.rewardQuizCompletion(subject?.name ?? 'exam');
-  await wallet.refreshTopicMastery();
+  try {
+    // Get subject name from Firestore
+    const subjectSnap = await getDoc(doc(firestore, 'subjects', finishedSession.subjectId));
+    const subject = subjectSnap.exists()
+      ? { id: subjectSnap.id, ...subjectSnap.data() } as { name?: string }
+      : null;
+
+    await wallet.rewardQuizCompletion(subject?.name ?? 'exam');
+    await wallet.refreshTopicMastery();
+  } catch (err) {
+    console.error('[ExamSession] Failed to reward/refresh:', err);
+  }
 
   router.replace({ name: 'exam-results', params: { examSessionId: finishedSession.id } });
 }

@@ -1,89 +1,126 @@
+<!-- src/views/DepartmentSelectView.vue -->
 <script setup lang="ts">
 import { ref, onMounted } from 'vue';
 import { useRouter } from 'vue-router';
-import { Stethoscope, HeartPulse, Pill, FlaskConical, Users, ChevronRight } from 'lucide-vue-next';
-import { db } from '../db';
+import { getDocs, collection } from 'firebase/firestore';
+import { firestore } from '../firebase';
 import { useAuthStore } from '../stores/auth';
+import { useWalletAndGamificationStore } from '../stores/walletAndGamification';
 import PulseLine from '../components/PulseLine.vue';
 import type { Department } from '../types/healthApp';
 
 const router = useRouter();
 const auth = useAuthStore();
+const wallet = useWalletAndGamificationStore();
+
 const departments = ref<Department[]>([]);
 const isLoading = ref(true);
-const isChoosing = ref(false);
-
-const iconMap: Record<string, typeof Stethoscope> = {
-  Stethoscope,
-  HeartPulse,
-  Pill,
-  FlaskConical,
-  Users,
-};
+const isSelecting = ref(false);
 
 onMounted(async () => {
-  departments.value = (await db.departments.toArray()).filter((d) => d.isActive);
-  isLoading.value = false;
+  try {
+    const snap = await getDocs(collection(firestore, 'departments'));
+    departments.value = snap.docs
+      .map((d) => ({ id: d.id, ...d.data() }) as Department)
+      .filter((d) => d.isActive !== false)
+      .sort((a, b) => a.name.localeCompare(b.name));
+  } catch (err) {
+    console.error('[DepartmentSelect] Failed to load:', err);
+  } finally {
+    isLoading.value = false;
+  }
 });
 
-async function choose(dept: Department) {
-  isChoosing.value = true;
-  await auth.chooseDepartment(dept.id);
-  router.push({ name: 'home' });
+async function selectDepartment(dept: Department) {
+  if (isSelecting.value) return;
+  isSelecting.value = true;
+
+  try {
+    await auth.chooseDepartment(dept.id);
+
+    // Initialize wallet + gamification for the new user
+    if (auth.userId) {
+      await wallet.initForUser(auth.userId);
+      await wallet.registerDailyLogin();
+    }
+
+    router.replace({ name: 'home' });
+  } catch (err) {
+    console.error('[DepartmentSelect] Failed to save selection:', err);
+  } finally {
+    isSelecting.value = false;
+  }
 }
+
+const iconMap: Record<string, string> = {
+  Stethoscope: '🩺',
+  HeartPulse: '💓',
+  Pill: '💊',
+};
 </script>
 
 <template>
-  <div class="min-h-screen flex flex-col bg-canvas">
-    <!-- Hero -->
-    <header class="relative bg-gradient-to-b from-ink-900 via-brand-800 to-brand-700 pt-14 pb-16 px-6 overflow-hidden">
-      <div class="absolute inset-x-0 top-1/2 -translate-y-1/2 opacity-40">
-        <PulseLine stroke="#2EE6B8" :height="70" />
+  <div class="min-h-screen flex flex-col bg-gradient-to-b from-ink-900 via-brand-800 to-brand-700 px-6 py-10">
+    <div class="relative max-w-lg mx-auto w-full flex-1 flex flex-col justify-center">
+      <div class="absolute inset-x-0 top-1/4 -translate-y-1/2 opacity-20 pointer-events-none">
+        <PulseLine stroke="#2EE6B8" :height="60" />
       </div>
 
-      <div class="relative max-w-md mx-auto text-center">
-        <span class="inline-flex items-center gap-1.5 rounded-full bg-white/10 border border-white/15 text-pulse text-[11px] font-mono font-semibold px-3 py-1 mb-5 tracking-wide">
-          OFFLINE-READY CBT
+      <!-- Header -->
+      <div class="relative text-center mb-8">
+        <span
+          class="inline-flex items-center gap-1.5 rounded-full bg-white/10 border border-white/15 text-pulse text-[11px] font-mono font-semibold px-3 py-1 mb-4 tracking-wide"
+        >
+          HEALTHPREP CBT
         </span>
-        <h1 class="font-display text-3xl font-bold text-white leading-tight">
-          Sharpen your exam vitals.
-        </h1>
-        <p class="text-brand-100 text-sm mt-2.5 max-w-xs mx-auto">
-          {{ auth.currentUser?.fullName ? `Welcome, ${auth.currentUser.fullName.split(' ')[0]}.` : 'Welcome.' }}
-          Choose your track to get started.
+        <h1 class="font-display text-2xl font-bold text-white">Choose your course</h1>
+        <p class="text-brand-100 text-sm mt-1.5">
+          This sets up your exam question bank. Pick the course that matches your programme.
         </p>
       </div>
-    </header>
 
-    <!-- Track picker -->
-    <div class="flex-1 max-w-md w-full mx-auto px-5 -mt-8 pb-10">
-      <div class="bg-white rounded-3xl shadow-panel px-4 pt-5 pb-4">
-        <p class="text-ink-500 text-xs font-semibold uppercase tracking-wide mb-3 px-1">Choose your track</p>
-
-        <div v-if="isLoading" class="text-center text-ink-300 text-sm py-10">Loading tracks…</div>
-
-        <div v-else class="space-y-2.5">
-          <button
-            v-for="dept in departments"
-            :key="dept.id"
-            type="button"
-            :disabled="isChoosing"
-            class="w-full flex items-center gap-3.5 bg-canvas hover:bg-brand-50 rounded-2xl px-4 py-3.5 text-left transition-colors disabled:opacity-60 border border-transparent hover:border-brand-200"
-            @click="choose(dept)"
-          >
-            <span class="flex items-center justify-center w-11 h-11 rounded-xl bg-brand-700 text-pulse shrink-0">
-              <component :is="iconMap[dept.iconName] ?? Stethoscope" class="w-5 h-5" />
-            </span>
-            <span class="flex-1 min-w-0">
-              <span class="block font-semibold text-ink-900 text-sm">{{ dept.name }}</span>
-              <span class="block text-xs text-ink-500 mt-0.5 truncate">{{ dept.description }}</span>
-            </span>
-            <ChevronRight class="w-4.5 h-4.5 text-ink-300 shrink-0" />
-          </button>
-        </div>
+      <!-- Loading -->
+      <div v-if="isLoading" class="text-center text-white/70 text-sm py-12">
+        Loading courses…
       </div>
 
-      <p class="text-center text-ink-300 text-xs mt-5">You can switch tracks anytime from your profile.</p>
+      <!-- Department cards -->
+      <div v-else class="relative space-y-3">
+        <button
+          v-for="dept in departments"
+          :key="dept.id"
+          type="button"
+          class="w-full flex items-center gap-4 bg-white/10 border border-white/15 hover:bg-white/20 hover:border-pulse/50 rounded-2xl px-5 py-5 text-left transition-all disabled:opacity-50"
+          :disabled="isSelecting"
+          @click="selectDepartment(dept)"
+        >
+          <span class="flex items-center justify-center w-12 h-12 rounded-xl bg-white/15 text-2xl shrink-0">
+            {{ iconMap[dept.iconName] ?? '📚' }}
+          </span>
+          <div class="flex-1 min-w-0">
+            <p class="font-semibold text-white text-sm">{{ dept.name }}</p>
+            <p class="text-brand-200 text-xs mt-0.5 line-clamp-2">{{ dept.description }}</p>
+          </div>
+          <svg
+            class="w-4 h-4 text-white/50 shrink-0"
+            fill="none"
+            viewBox="0 0 24 24"
+            stroke="currentColor"
+            stroke-width="2"
+          >
+            <path stroke-linecap="round" stroke-linejoin="round" d="M9 5l7 7-7 7" />
+          </svg>
+        </button>
+
+        <p v-if="departments.length === 0" class="text-center text-white/60 text-sm py-8">
+          No courses available yet. Please check back later.
+        </p>
+      </div>
+
+      <!-- Footer -->
+      <p class="relative text-center text-white/50 text-xs mt-8">
+        You can contact support if you need to change your course later.
+      </p>
     </div>
   </div>
 </template>

@@ -1,20 +1,33 @@
+<!-- src/views/ExamSetupView.vue -->
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue';
 import { useRouter } from 'vue-router';
-import { ChevronLeft, Coins, Clock, Zap, Target, ListChecks } from 'lucide-vue-next';
-import { db, uid, ensureSubjectDownloaded } from '../db';
+import {
+  getDoc, getDocs, setDoc, doc,
+  collection, query, where,
+} from 'firebase/firestore';
+import { firestore } from '../firebase';
+import { db as localDb, uid } from '../db/schema';
+import {
+  ChevronLeft, Coins, Clock, Zap, Target, ListChecks,
+} from 'lucide-vue-next';
 import { useAuthStore } from '../stores/auth';
 import { useWalletAndGamificationStore } from '../stores/walletAndGamification';
 import type { Subject, ExamSession, ExamMode, Question } from '../types/healthApp';
+
+/* ── Props / stores ─────────────────────────────────────────────────────── */
 
 const props = defineProps<{ subjectId: string }>();
 const router = useRouter();
 const auth = useAuthStore();
 const wallet = useWalletAndGamificationStore();
 
+/* ── State ──────────────────────────────────────────────────────────────── */
+
 const subject = ref<Subject | null>(null);
 const isLoading = ref(true);
 const isStarting = ref(false);
+const loadError = ref<string | null>(null);
 const errorMessage = ref<string | null>(null);
 
 type ModeOption = {
@@ -29,13 +42,49 @@ type ModeOption = {
 
 const selectedModeKey = ref<ExamMode>('practice');
 
+/* ── Load subject + wallet ──────────────────────────────────────────────── */
+
 onMounted(async () => {
-  subject.value = (await ensureSubjectDownloaded(props.subjectId)) ?? (await db.subjects.get(props.subjectId)) ?? null;
-  if (auth.userId) {
-    await wallet.initForUser(auth.userId);
+  try {
+    // 1) Load subject from Firestore
+    try {
+      const snap = await getDoc(doc(firestore, 'subjects', props.subjectId));
+      if (snap.exists()) {
+        subject.value = { id: snap.id, ...snap.data() } as Subject;
+      }
+    } catch (e) {
+      console.error('[ExamSetup] Failed to load subject from Firestore:', e);
+    }
+
+    // Fallback to local cache if offline
+    if (!subject.value) {
+      try {
+        const local = await localDb.subjects.get(props.subjectId);
+        if (local) subject.value = local as Subject;
+      } catch { /* no local cache */ }
+    }
+
+    // 2) Wallet — must never block free practice modes
+    if (auth.userId) {
+      try {
+        await wallet.initForUser(auth.userId);
+      } catch (e) {
+        console.error('[ExamSetup] wallet.initForUser failed:', e);
+      }
+    }
+
+    if (!subject.value) {
+      loadError.value = 'Could not load this subject. Check your connection and try again.';
+    }
+  } catch (e) {
+    console.error('[ExamSetup] load failed:', e);
+    loadError.value = 'Something went wrong while loading this page. Please try again.';
+  } finally {
+    isLoading.value = false;
   }
-  isLoading.value = false;
 });
+
+/* ── Mode options ───────────────────────────────────────────────────────── */
 
 const modeOptions = computed<ModeOption[]>(() => {
   const total = subject.value?.totalQuestionCount ?? 20;
@@ -70,7 +119,11 @@ const modeOptions = computed<ModeOption[]>(() => {
   ];
 });
 
-const selectedMode = computed(() => modeOptions.value.find((m) => m.mode === selectedModeKey.value)!);
+const selectedMode = computed(
+  () => modeOptions.value.find((m) => m.mode === selectedModeKey.value)!,
+);
+
+/* ── Helpers ────────────────────────────────────────────────────────────── */
 
 function shuffle<T>(arr: T[]): T[] {
   const copy = [...arr];
@@ -81,33 +134,54 @@ function shuffle<T>(arr: T[]): T[] {
   return copy;
 }
 
+/* ── Start exam ─────────────────────────────────────────────────────────── */
+
 async function startExam() {
-  if (!subject.value || !auth.userId) return;
+  if (!subject.value || !auth.userId || isStarting.value) return;
   errorMessage.value = null;
   isStarting.value = true;
 
   try {
     const config = selectedMode.value;
 
-    if (config.costCredits > 0) {
-      const spent = await wallet.spendCredits(
-        config.costCredits,
-        'spent-mock-unlock',
-        `Unlocked full mock exam — ${subject.value.name}`
+    // ── Fetch questions from Firestore (with local cache fallback) ──
+    let allQuestions: Question[] = [];
+    try {
+      const qSnap = await getDocs(
+        query(
+          collection(firestore, 'questions'),
+          where('subjectId', '==', subject.value.id),
+        ),
       );
-      if (!spent) {
-        errorMessage.value = `You need ${config.costCredits} credits for a full mock exam. You have ${wallet.creditBalance}.`;
-        isStarting.value = false;
-        return;
-      }
+      allQuestions = qSnap.docs.map((d) => ({ id: d.id, ...d.data() }) as Question);
+    } catch (e) {
+      // Offline — use local cache
+      console.warn('[ExamSetup] Firestore questions unavailable, trying local cache');
+      try {
+        allQuestions = await localDb.questions
+          .where('subjectId')
+          .equals(subject.value.id)
+          .toArray() as Question[];
+      } catch { /* no cache */ }
     }
 
-    const allQuestions: Question[] = await db.questions.where('subjectId').equals(subject.value.id).toArray();
+    if (allQuestions.length === 0) {
+      errorMessage.value = 'No questions are available for this subject yet. Please check back later.';
+      return;
+    }
+
+    // ── Cache questions locally for offline exam ──
+    try {
+      await localDb.questions.bulkPut(allQuestions);
+      await localDb.subjects.put(subject.value);
+    } catch { /* cache is best-effort */ }
+
+    // ── Build session ──
     const questionOrder = shuffle(allQuestions)
       .slice(0, config.questionCount)
       .map((q) => q.id);
 
-    const newSession: ExamSession = {
+    const newSession = {
       id: uid('exam'),
       userId: auth.userId,
       subjectId: subject.value.id,
@@ -124,10 +198,36 @@ async function startExam() {
       wrongCount: null,
       unansweredCount: null,
       questionOrder,
-    };
+    } as unknown as ExamSession;
 
-    await db.exam_sessions.add(newSession);
-    router.push({ name: 'exam-session', params: { examSessionId: newSession.id } });
+    // ── Spend credits (mock mode) ──
+    if (config.costCredits > 0) {
+      const spent = await wallet.spendCredits(
+        config.costCredits,
+        'spent-mock-unlock',
+        `Unlocked full mock exam — ${subject.value.name}`,
+      );
+      if (!spent) {
+        errorMessage.value = `You need ${config.costCredits} credits for a full mock exam. You have ${wallet.creditBalance}.`;
+        return;
+      }
+    }
+
+    // ── Save session to Firestore + local cache ──
+    try {
+      await setDoc(doc(firestore, 'exam_sessions', newSession.id), newSession);
+    } catch {
+      // Offline — save locally only, will sync later
+    }
+    await localDb.exam_sessions.put(newSession as any);
+
+    await router.push({
+      name: 'exam-session',
+      params: { examSessionId: newSession.id },
+    });
+  } catch (e) {
+    console.error('[ExamSetup] startExam failed:', e);
+    errorMessage.value = 'Could not start the exam. Please try again.';
   } finally {
     isStarting.value = false;
   }
@@ -138,14 +238,29 @@ async function startExam() {
   <div class="min-h-screen bg-canvas">
     <header class="bg-white border-b border-ink-100 px-4 py-4">
       <div class="max-w-2xl mx-auto flex items-center gap-3">
-        <button type="button" class="p-1.5 -ml-1.5 rounded-lg hover:bg-ink-50" @click="router.back()">
+        <button
+          type="button"
+          class="p-1.5 -ml-1.5 rounded-lg hover:bg-ink-50"
+          @click="router.back()"
+        >
           <ChevronLeft class="w-5 h-5 text-ink-700" />
         </button>
-        <h1 class="font-display font-bold text-ink-900">{{ subject?.name ?? 'Set up your exam' }}</h1>
+        <h1 class="font-display font-bold text-ink-900">
+          {{ subject?.name ?? 'Set up your exam' }}
+        </h1>
       </div>
     </header>
 
-    <div v-if="isLoading" class="text-sm text-ink-300 text-center py-16">Preparing subject…</div>
+    <div v-if="isLoading" class="text-sm text-ink-300 text-center py-16">
+      Preparing subject…
+    </div>
+
+    <div
+      v-else-if="loadError"
+      class="max-w-2xl mx-auto px-4 py-16 text-center text-sm text-coral-dim"
+    >
+      {{ loadError }}
+    </div>
 
     <div v-else class="max-w-2xl mx-auto px-4 py-6">
       <div class="flex items-center justify-between mb-5">
@@ -161,33 +276,53 @@ async function startExam() {
           :key="option.mode"
           type="button"
           class="w-full text-left rounded-2xl border-2 px-4 py-4 transition-colors"
-          :class="selectedModeKey === option.mode ? 'border-brand-500 bg-brand-50' : 'border-ink-100 bg-white hover:border-ink-200'"
+          :class="
+            selectedModeKey === option.mode
+              ? 'border-brand-500 bg-brand-50'
+              : 'border-ink-100 bg-white hover:border-ink-200'
+          "
           @click="selectedModeKey = option.mode"
         >
           <div class="flex items-center gap-3">
             <span
               class="flex items-center justify-center w-10 h-10 rounded-xl shrink-0"
-              :class="selectedModeKey === option.mode ? 'bg-brand-600 text-white' : 'bg-ink-50 text-ink-500'"
+              :class="
+                selectedModeKey === option.mode
+                  ? 'bg-brand-600 text-white'
+                  : 'bg-ink-50 text-ink-500'
+              "
             >
               <component :is="option.icon" class="w-5 h-5" />
             </span>
             <div class="flex-1 min-w-0">
               <div class="flex items-center justify-between gap-2">
                 <p class="font-semibold text-ink-900 text-sm">{{ option.label }}</p>
-                <span v-if="option.costCredits > 0" class="text-xs font-mono font-bold text-gold-dim shrink-0">{{ option.costCredits }} cr</span>
+                <span
+                  v-if="option.costCredits > 0"
+                  class="text-xs font-mono font-bold text-gold-dim shrink-0"
+                >
+                  {{ option.costCredits }} cr
+                </span>
                 <span v-else class="text-xs font-bold text-brand-600 shrink-0">Free</span>
               </div>
               <p class="text-xs text-ink-500 mt-0.5">{{ option.description }}</p>
               <div class="flex items-center gap-3 mt-2 text-[11px] text-ink-300 font-mono">
-                <span class="inline-flex items-center gap-1"><ListChecks class="w-3 h-3" /> {{ option.questionCount }}Q</span>
-                <span class="inline-flex items-center gap-1"><Clock class="w-3 h-3" /> {{ option.durationMinutes }}m</span>
+                <span class="inline-flex items-center gap-1">
+                  <ListChecks class="w-3 h-3" /> {{ option.questionCount }}Q
+                </span>
+                <span class="inline-flex items-center gap-1">
+                  <Clock class="w-3 h-3" /> {{ option.durationMinutes }}m
+                </span>
               </div>
             </div>
           </div>
         </button>
       </div>
 
-      <p v-if="errorMessage" class="text-sm text-coral-dim bg-coral-soft border border-coral/30 rounded-xl px-3.5 py-2.5 mt-4">
+      <p
+        v-if="errorMessage"
+        class="text-sm text-coral-dim bg-coral-soft border border-coral/30 rounded-xl px-3.5 py-2.5 mt-4"
+      >
         {{ errorMessage }}
       </p>
 

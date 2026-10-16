@@ -5,3 +5,30 @@ dist-ssr
 .DS_Store
 dev-dist
 *.tsbuildinfo
+
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+dev-dist/
+
+# Environment variables (CRITICAL — contains Firebase API keys)
+.env
+.env.local
+.env.production
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Firebase
+.firebase/
+*-debug.log
+
+# TypeScript
+*.tsbuildinfo

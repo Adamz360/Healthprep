@@ -1,3 +1,4 @@
+<!-- src/views/WalletView.vue -->
 <script setup lang="ts">
 import { ref, onMounted, computed } from 'vue';
 import { useRouter } from 'vue-router';
@@ -16,7 +17,12 @@ import {
 } from 'lucide-vue-next';
 import { useAuthStore } from '../stores/auth';
 import { useWalletAndGamificationStore } from '../stores/walletAndGamification';
-import { createPendingPayment, markPaymentSuccessful, markPaymentFailed, generatePaymentReference } from '../db';
+import {
+  createPendingPayment,
+  markPaymentSuccessful,
+  markPaymentFailed,
+  generatePaymentReference,
+} from '../services/wallet';
 import type { CreditPackage, PaymentGateway, MockVirtualAccount } from '../types/healthApp';
 
 const router = useRouter();
@@ -34,7 +40,7 @@ onMounted(async () => {
 });
 
 const referralShareText = computed(
-  () => `Join me on HealthPrep CBT and get bonus credits! Use my code ${wallet.referralCode} when you sign up.`
+  () => `Join me on HealthPrep CBT and get bonus credits! Use my code ${wallet.referralCode} when you sign up.`,
 );
 
 async function copyReferralCode() {
@@ -44,7 +50,7 @@ async function copyReferralCode() {
     codeCopied.value = true;
     setTimeout(() => (codeCopied.value = false), 2000);
   } catch {
-    // Clipboard API unavailable — silently ignore, code is still visible on screen.
+    // Clipboard API unavailable
   }
 }
 
@@ -57,17 +63,20 @@ function shareReferral() {
 }
 
 function formatDate(iso: string): string {
-  return new Date(iso).toLocaleDateString('en-NG', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+  return new Date(iso).toLocaleDateString('en-NG', {
+    month: 'short',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+  });
 }
 
-function handleLogout() {
-  auth.logout();
+async function handleLogout() {
+  await auth.logout();
   router.replace({ name: 'login' });
 }
 
-/* -------------------------------------------------------------------------- */
-/*  Buy Credit — mock bank-transfer virtual account flow                     */
-/* -------------------------------------------------------------------------- */
+/* ── Buy Credit flow ───────────────────────────────────────────────────── */
 
 const CREDIT_PACKAGES: CreditPackage[] = [
   { id: 'pkg-100', credits: 100, amountNaira: 500 },
@@ -117,7 +126,9 @@ async function chooseGateway(gateway: PaymentGateway) {
   if (!selectedPackage.value || !auth.userId) return;
   selectedGateway.value = gateway;
 
-  const bankName = gateway === 'paystack-titan-trust' ? 'Titan Trust Bank' : 'Wema Bank (Flutterwave)';
+  const bankName = gateway === 'paystack-titan-trust'
+    ? 'Titan Trust Bank'
+    : 'Wema Bank (Flutterwave)';
   const accountNumber = generateMockAccountNumber();
   const reference = generatePaymentReference();
 
@@ -132,22 +143,21 @@ async function chooseGateway(gateway: PaymentGateway) {
     expiresAt: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
   };
 
-  // Persist a real Payment record the moment the virtual account is
-  // generated (status: pending) — this is what backs the admin Payment
-  // Dashboard / Records page, distinct from the credit-ledger entry that
-  // only gets created once the payment actually succeeds.
-  const payment = await createPendingPayment({
-    userId: auth.userId,
-    gateway,
-    amountNaira: selectedPackage.value.amountNaira,
-    credits: selectedPackage.value.credits,
-    virtualAccountNumber: accountNumber,
-    virtualBankName: bankName,
-    reference,
-  });
-  currentPaymentId.value = payment.id;
-
-  buyStep.value = 'account';
+  try {
+    const payment = await createPendingPayment({
+      userId: auth.userId,
+      gateway,
+      amountNaira: selectedPackage.value.amountNaira,
+      credits: selectedPackage.value.credits,
+      virtualAccountNumber: accountNumber,
+      virtualBankName: bankName,
+      reference,
+    });
+    currentPaymentId.value = payment.id;
+    buyStep.value = 'account';
+  } catch (err: any) {
+    console.error('[Wallet] Failed to create payment:', err);
+  }
 }
 
 async function copyAccountNumber() {
@@ -166,21 +176,24 @@ async function verifyPayment() {
   isVerifying.value = true;
 
   try {
-    // Mock verification — in a real integration this would poll Paystack /
-    // Flutterwave's verify-transaction endpoint using the reference above.
+    // Mock verification — real integration would poll Paystack/Flutterwave
     await new Promise((resolve) => setTimeout(resolve, 1500));
 
     try {
       const walletTx = await wallet.earnCredits(
         'purchased-credit',
-        `Purchased ${virtualAccount.value.credits} credits via ${virtualAccount.value.gateway === 'paystack-titan-trust' ? 'Paystack (Titan Trust)' : 'Flutterwave'}`,
-        virtualAccount.value.credits
+        `Purchased ${virtualAccount.value.credits} credits via ${
+          virtualAccount.value.gateway === 'paystack-titan-trust'
+            ? 'Paystack (Titan Trust)'
+            : 'Flutterwave'
+        }`,
+        virtualAccount.value.credits,
       );
       await markPaymentSuccessful(currentPaymentId.value, walletTx.id);
       buyStep.value = 'success';
     } catch {
       await markPaymentFailed(currentPaymentId.value);
-      buyStep.value = 'success'; // mock flow always "succeeds" from the credit side; failure path is for real-gateway parity
+      buyStep.value = 'success';
     }
   } finally {
     isVerifying.value = false;
@@ -206,7 +219,8 @@ async function verifyPayment() {
       <div class="bg-gradient-to-br from-ink-900 to-brand-800 rounded-3xl p-5 text-white shadow-panel">
         <p class="text-brand-200 text-xs font-mono uppercase tracking-wide">Credit Balance</p>
         <p class="font-display text-5xl font-bold mt-1.5 flex items-center gap-2">
-          <Coins class="w-8 h-8 text-gold" /> <span class="font-mono">{{ wallet.creditBalance }}</span>
+          <Coins class="w-8 h-8 text-gold" />
+          <span class="font-mono">{{ wallet.creditBalance }}</span>
         </p>
         <div class="flex items-center justify-between mt-4">
           <div class="flex gap-4 text-xs text-brand-200 font-mono">
@@ -232,14 +246,18 @@ async function verifyPayment() {
           <p class="text-sm font-semibold text-ink-900">
             <span class="font-mono">{{ wallet.currentStreak }}</span> day streak
           </p>
-          <p class="text-xs text-ink-500">Longest: <span class="font-mono">{{ wallet.longestStreak }}</span> days · +5 credits per day</p>
+          <p class="text-xs text-ink-500">
+            Longest: <span class="font-mono">{{ wallet.longestStreak }}</span> days · +5 credits per day
+          </p>
         </div>
       </div>
 
       <!-- Referral -->
       <div class="bg-white rounded-2xl border border-ink-100 shadow-card p-4">
         <p class="text-sm font-semibold text-ink-900 mb-1">Invite friends, earn credits</p>
-        <p class="text-xs text-ink-500 mb-3">You get 30 credits, they get 15 — for every friend who joins with your code.</p>
+        <p class="text-xs text-ink-500 mb-3">
+          You get 30 credits, they get 15 — for every friend who joins with your code.
+        </p>
 
         <div class="flex items-center gap-2">
           <div class="flex-1 bg-canvas border border-dashed border-ink-200 rounded-xl px-3 py-2.5 font-mono font-bold text-brand-700 text-center tracking-wider">
@@ -273,7 +291,11 @@ async function verifyPayment() {
         </div>
 
         <div v-else class="divide-y divide-ink-50">
-          <div v-for="tx in wallet.recentTransactions" :key="tx.id" class="flex items-center justify-between py-2.5 gap-2">
+          <div
+            v-for="tx in wallet.recentTransactions"
+            :key="tx.id"
+            class="flex items-center justify-between py-2.5 gap-2"
+          >
             <div class="flex items-center gap-2.5 min-w-0">
               <span
                 class="flex items-center justify-center w-7 h-7 rounded-full shrink-0"
@@ -287,7 +309,10 @@ async function verifyPayment() {
                 <p class="text-[11px] text-ink-300 font-mono">{{ formatDate(tx.createdAt) }}</p>
               </div>
             </div>
-            <span class="text-sm font-mono font-bold shrink-0" :class="tx.amount > 0 ? 'text-brand-600' : 'text-coral'">
+            <span
+              class="text-sm font-mono font-bold shrink-0"
+              :class="tx.amount > 0 ? 'text-brand-600' : 'text-coral'"
+            >
               {{ tx.amount > 0 ? '+' : '' }}{{ tx.amount }}
             </span>
           </div>
@@ -309,7 +334,10 @@ async function verifyPayment() {
     </div>
 
     <!-- Buy Credit modal flow -->
-    <div v-if="buyStep !== 'closed'" class="fixed inset-0 z-30 bg-ink-900/50 backdrop-blur-sm flex items-end sm:items-center justify-center p-0 sm:p-4">
+    <div
+      v-if="buyStep !== 'closed'"
+      class="fixed inset-0 z-30 bg-ink-900/50 backdrop-blur-sm flex items-end sm:items-center justify-center p-0 sm:p-4"
+    >
       <div class="bg-white rounded-t-3xl sm:rounded-3xl shadow-panel max-w-sm w-full p-6 animate-popIn max-h-[90vh] overflow-y-auto">
         <!-- Step: choose amount -->
         <template v-if="buyStep === 'amount'">
@@ -327,7 +355,10 @@ async function verifyPayment() {
               <div>
                 <p class="font-mono font-bold text-ink-900 text-sm flex items-center gap-1.5">
                   {{ pkg.credits }} credits
-                  <span v-if="pkg.isPopular" class="text-[10px] font-sans font-semibold bg-gold-soft text-gold-dim rounded-full px-2 py-0.5">
+                  <span
+                    v-if="pkg.isPopular"
+                    class="text-[10px] font-sans font-semibold bg-gold-soft text-gold-dim rounded-full px-2 py-0.5"
+                  >
                     POPULAR
                   </span>
                 </p>
@@ -337,7 +368,11 @@ async function verifyPayment() {
             </button>
           </div>
 
-          <button type="button" class="w-full mt-4 text-center text-sm font-medium text-ink-500 py-2" @click="closeBuyCredit">
+          <button
+            type="button"
+            class="w-full mt-4 text-center text-sm font-medium text-ink-500 py-2"
+            @click="closeBuyCredit"
+          >
             Cancel
           </button>
         </template>
@@ -347,7 +382,9 @@ async function verifyPayment() {
           <h4 class="font-display text-lg font-bold text-ink-900 mb-1">Pay via Bank Transfer</h4>
           <p class="text-sm text-ink-500 mb-4">
             {{ selectedPackage?.credits }} credits for
-            <span class="font-mono font-semibold text-ink-700">₦{{ selectedPackage?.amountNaira.toLocaleString() }}</span>
+            <span class="font-mono font-semibold text-ink-700">
+              ₦{{ selectedPackage?.amountNaira.toLocaleString() }}
+            </span>
             — choose a provider.
           </p>
 
@@ -369,7 +406,11 @@ async function verifyPayment() {
             </button>
           </div>
 
-          <button type="button" class="w-full mt-4 text-center text-sm font-medium text-ink-500 py-2" @click="buyStep = 'amount'">
+          <button
+            type="button"
+            class="w-full mt-4 text-center text-sm font-medium text-ink-500 py-2"
+            @click="buyStep = 'amount'"
+          >
             Back
           </button>
         </template>
@@ -377,7 +418,9 @@ async function verifyPayment() {
         <!-- Step: virtual account details -->
         <template v-else-if="buyStep === 'account' && virtualAccount">
           <h4 class="font-display text-lg font-bold text-ink-900 mb-1">Transfer to complete</h4>
-          <p class="text-sm text-ink-500 mb-4">Send exactly this amount from your bank app. Credits apply instantly after verification.</p>
+          <p class="text-sm text-ink-500 mb-4">
+            Send exactly this amount from your bank app. Credits apply instantly after verification.
+          </p>
 
           <div class="bg-ink-900 rounded-2xl p-5 text-white space-y-3.5">
             <div>
@@ -387,7 +430,9 @@ async function verifyPayment() {
             <div>
               <p class="text-brand-200 text-[11px] font-mono uppercase tracking-wide">Account Number</p>
               <div class="flex items-center gap-2 mt-0.5">
-                <p class="font-mono font-bold text-xl tracking-wider text-pulse">{{ virtualAccount.accountNumber }}</p>
+                <p class="font-mono font-bold text-xl tracking-wider text-pulse">
+                  {{ virtualAccount.accountNumber }}
+                </p>
                 <button type="button" class="text-white/70 hover:text-white" @click="copyAccountNumber">
                   <Check v-if="accountCopied" class="w-4 h-4 text-pulse" />
                   <Copy v-else class="w-4 h-4" />
@@ -400,7 +445,9 @@ async function verifyPayment() {
             </div>
             <div class="flex items-center justify-between pt-3 border-t border-white/10">
               <p class="text-brand-200 text-[11px] font-mono uppercase tracking-wide">Amount</p>
-              <p class="font-mono font-bold text-lg text-gold">₦{{ virtualAccount.amountNaira.toLocaleString() }}</p>
+              <p class="font-mono font-bold text-lg text-gold">
+                ₦{{ virtualAccount.amountNaira.toLocaleString() }}
+              </p>
             </div>
           </div>
 
@@ -416,7 +463,11 @@ async function verifyPayment() {
             {{ isVerifying ? 'Verifying…' : 'Verify Payment' }}
           </button>
 
-          <button type="button" class="w-full mt-2 text-center text-sm font-medium text-ink-500 py-2" @click="closeBuyCredit">
+          <button
+            type="button"
+            class="w-full mt-2 text-center text-sm font-medium text-ink-500 py-2"
+            @click="closeBuyCredit"
+          >
             Cancel
           </button>
         </template>
@@ -429,7 +480,9 @@ async function verifyPayment() {
             </span>
             <h4 class="font-display text-lg font-bold text-ink-900">Payment verified!</h4>
             <p class="text-sm text-ink-500 mt-1.5">
-              <span class="font-mono font-semibold text-brand-700">{{ virtualAccount.credits }} credits</span>
+              <span class="font-mono font-semibold text-brand-700">
+                {{ virtualAccount.credits }} credits
+              </span>
               have been added to your wallet.
             </p>
           </div>

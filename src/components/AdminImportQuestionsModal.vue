@@ -1,16 +1,26 @@
+<!-- src/components/AdminImportQuestionsModal.vue -->
 <script setup lang="ts">
 import { ref, computed } from 'vue';
-import { UploadCloud, Download, X, CheckCircle2, AlertTriangle, FileSpreadsheet } from 'lucide-vue-next';
-import { db, createQuestion, resolveOrCreateTopic } from '../db';
+import {
+  UploadCloud, Download, X, CheckCircle2, AlertTriangle, FileSpreadsheet,
+} from 'lucide-vue-next';
+import { getDocs, collection } from 'firebase/firestore';
+import { firestore } from '../firebase';
+import { resolveOrCreateTopic, createQuestion } from '../services/content';
 import { parseCsv, toCsv, downloadTextFile } from '../utils/csv';
-import type { Department, Subject, QuestionDifficulty, QuestionOption } from '../types/healthApp';
+import type {
+  Department,
+  Subject,
+  QuestionDifficulty,
+  QuestionOption,
+} from '../types/healthApp';
 
 const emit = defineEmits<{ (e: 'close'): void; (e: 'imported'): void }>();
 
 type CsvRow = Record<string, string>;
 
 interface ParsedRow {
-  index: number; // 1-based, matches spreadsheet row number (row 1 = header)
+  index: number;
   raw: CsvRow;
   errors: string[];
   resolved: {
@@ -25,19 +35,15 @@ interface ParsedRow {
   } | null;
 }
 
-const REQUIRED_COLUMNS = ['department', 'subject', 'topic', 'question', 'optionA', 'optionB', 'correctOption'];
+const REQUIRED_COLUMNS = [
+  'department', 'subject', 'topic', 'question',
+  'optionA', 'optionB', 'correctOption',
+];
+
 const TEMPLATE_HEADERS = [
-  'department',
-  'subject',
-  'topic',
-  'question',
-  'optionA',
-  'optionB',
-  'optionC',
-  'optionD',
-  'correctOption',
-  'difficulty',
-  'explanation',
+  'department', 'subject', 'topic', 'question',
+  'optionA', 'optionB', 'optionC', 'optionD',
+  'correctOption', 'difficulty', 'explanation',
 ];
 
 const step = ref<'upload' | 'preview' | 'summary'>('upload');
@@ -80,7 +86,14 @@ function downloadTemplate() {
     },
   ];
 
-  const csv = toCsv(sampleRows.map((r) => ({ ...TEMPLATE_HEADERS.reduce((acc, h) => ({ ...acc, [h]: (r as Record<string, string>)[h] ?? '' }), {}) })));
+  const csv = toCsv(
+    sampleRows.map((r) => ({
+      ...TEMPLATE_HEADERS.reduce(
+        (acc, h) => ({ ...acc, [h]: (r as Record<string, string>)[h] ?? '' }),
+        {},
+      ),
+    })),
+  );
   downloadTextFile('question-import-template.csv', csv);
 }
 
@@ -112,15 +125,27 @@ async function handleFileChange(event: Event) {
 
   isValidating.value = true;
   try {
-    const departments = await db.departments.toArray();
-    const subjects = await db.subjects.toArray();
+    // ── Fetch departments AND subjects from Firestore ──
+    const [deptSnap, subjSnap] = await Promise.all([
+      getDocs(collection(firestore, 'departments')),
+      getDocs(collection(firestore, 'subjects')),
+    ]);
+
+    const departments = deptSnap.docs.map(
+      (d) => ({ id: d.id, ...d.data() }) as Department,
+    );
+    const subjects = subjSnap.docs.map(
+      (d) => ({ id: d.id, ...d.data() }) as Subject,
+    );
 
     const rows: ParsedRow[] = [];
     for (let i = 0; i < data.length; i++) {
-      rows.push(await validateRow(data[i], i + 2, departments, subjects)); // +2: header is row 1, data starts row 2
+      rows.push(await validateRow(data[i], i + 2, departments, subjects));
     }
     parsedRows.value = rows;
     step.value = 'preview';
+  } catch (err: any) {
+    parseError.value = err.message ?? 'Failed to validate rows.';
   } finally {
     isValidating.value = false;
   }
@@ -130,7 +155,7 @@ async function validateRow(
   raw: CsvRow,
   index: number,
   departments: Department[],
-  subjects: Subject[]
+  subjects: Subject[],
 ): Promise<ParsedRow> {
   const errors: string[] = [];
 
@@ -141,13 +166,20 @@ async function validateRow(
   const correctRaw = (raw.correctOption ?? '').trim().toUpperCase();
   const difficultyRaw = (raw.difficulty ?? 'medium').trim().toLowerCase();
 
-  const department = departments.find((d) => d.name.toLowerCase() === deptName.toLowerCase()) ?? null;
+  const department =
+    departments.find((d) => d.name.toLowerCase() === deptName.toLowerCase()) ?? null;
   if (!department) errors.push(`Unknown department "${deptName}"`);
 
   const subject = department
-    ? subjects.find((s) => s.departmentId === department.id && s.name.toLowerCase() === subjectName.toLowerCase()) ?? null
+    ? subjects.find(
+        (s) =>
+          s.departmentId === department.id &&
+          s.name.toLowerCase() === subjectName.toLowerCase(),
+      ) ?? null
     : null;
-  if (department && !subject) errors.push(`Unknown subject "${subjectName}" under "${deptName}"`);
+  if (department && !subject) {
+    errors.push(`Unknown subject "${subjectName}" under "${deptName}"`);
+  }
 
   if (!topicName) errors.push('Topic is required');
   if (stem.length < 5) errors.push('Question text is too short');
@@ -164,7 +196,9 @@ async function validateRow(
     errors.push(`correctOption "${correctRaw || '(blank)'}" doesn't match a filled-in option`);
   }
 
-  const difficulty: QuestionDifficulty = (['easy', 'medium', 'hard'] as const).includes(difficultyRaw as QuestionDifficulty)
+  const difficulty: QuestionDifficulty = (
+    ['easy', 'medium', 'hard'] as const
+  ).includes(difficultyRaw as QuestionDifficulty)
     ? (difficultyRaw as QuestionDifficulty)
     : 'medium';
 
@@ -200,7 +234,10 @@ async function confirmImport() {
         continue;
       }
       try {
-        const topic = await resolveOrCreateTopic(row.resolved.subject.id, row.resolved.topicName);
+        const topic = await resolveOrCreateTopic(
+          row.resolved.subject.id,
+          row.resolved.topicName,
+        );
         await createQuestion({
           subjectId: row.resolved.subject.id,
           departmentId: row.resolved.subject.departmentId,
@@ -268,7 +305,10 @@ function reset() {
         </label>
 
         <p v-if="isValidating" class="text-sm text-ink-400 text-center mt-4">Validating rows…</p>
-        <p v-if="parseError" class="text-sm text-coral-dim bg-coral-soft border border-coral/30 rounded-xl px-3.5 py-2.5 mt-4">
+        <p
+          v-if="parseError"
+          class="text-sm text-coral-dim bg-coral-soft border border-coral/30 rounded-xl px-3.5 py-2.5 mt-4"
+        >
           {{ parseError }}
         </p>
       </template>
@@ -303,7 +343,11 @@ function reset() {
         </div>
 
         <div class="flex gap-2.5 mt-5">
-          <button type="button" class="flex-1 rounded-xl border border-ink-200 text-ink-600 text-sm font-medium py-2.5" @click="reset">
+          <button
+            type="button"
+            class="flex-1 rounded-xl border border-ink-200 text-ink-600 text-sm font-medium py-2.5"
+            @click="reset"
+          >
             Choose Different File
           </button>
           <button
@@ -329,7 +373,11 @@ function reset() {
             <span class="font-mono font-semibold text-coral">{{ failedCount }}</span> failed
           </p>
         </div>
-        <button type="button" class="w-full rounded-xl bg-brand-700 hover:bg-brand-800 text-white font-semibold py-3 transition-colors" @click="emit('close')">
+        <button
+          type="button"
+          class="w-full rounded-xl bg-brand-700 hover:bg-brand-800 text-white font-semibold py-3 transition-colors"
+          @click="emit('close')"
+        >
           Done
         </button>
       </template>

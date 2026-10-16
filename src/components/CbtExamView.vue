@@ -1,5 +1,6 @@
+<!-- src/components/CbtExamView.vue -->
 <script setup lang="ts">
-import { ref, computed, onMounted, onBeforeUnmount } from 'vue';
+import { ref, shallowRef, computed, onMounted, onBeforeUnmount, toRaw } from 'vue';
 import {
   Wifi,
   WifiOff,
@@ -12,12 +13,18 @@ import {
   ChevronRight,
   Send,
 } from 'lucide-vue-next';
-import { db, uid } from '../db';
-import type { Question, UserResponse, ExamSession, ResponseFlag, QuestionOption } from '../types/healthApp';
+import { doc, getDoc, setDoc, updateDoc } from 'firebase/firestore';
+import { firestore } from '../firebase';
+import { db, uid } from '../db/schema';
+import type {
+  Question,
+  UserResponse,
+  ExamSession,
+  ResponseFlag,
+  QuestionOption,
+} from '../types/healthApp';
 
-/* -------------------------------------------------------------------------- */
-/*  Props / Emits                                                             */
-/* -------------------------------------------------------------------------- */
+/* ── Props / Emits ──────────────────────────────────────────────────────── */
 
 const props = defineProps<{
   examSessionId: string;
@@ -29,27 +36,35 @@ const emit = defineEmits<{
   (e: 'exam-submitted', session: ExamSession): void;
 }>();
 
-/* -------------------------------------------------------------------------- */
-/*  State                                                                     */
-/* -------------------------------------------------------------------------- */
+/* ── Helpers ────────────────────────────────────────────────────────────── */
 
-const session = ref<ExamSession | null>(null);
-const questions = ref<Question[]>([]);
-const responsesByQuestionId = ref<Map<string, UserResponse>>(new Map());
+function toPlain<T>(value: T): T {
+  return JSON.parse(JSON.stringify(toRaw(value)));
+}
+
+/* ── State ──────────────────────────────────────────────────────────────── */
+
+const session = shallowRef<ExamSession | null>(null);
+const questions = shallowRef<Question[]>([]);
+const responsesByQuestionId = shallowRef<Map<string, UserResponse>>(new Map());
+
 const currentIndex = ref(0);
 const remainingSeconds = ref(0);
 const isWarningActive = ref(false);
 const isOnline = ref(navigator.onLine);
 const isSubmitting = ref(false);
 const isLoading = ref(true);
+const confirmSubmitOpen = ref(false);
+const submitError = ref<string | null>(null);
 
 let timerWorker: Worker | null = null;
+let expiredWhileSubmitting = false;
 
-/* -------------------------------------------------------------------------- */
-/*  Derived state                                                             */
-/* -------------------------------------------------------------------------- */
+/* ── Derived state ──────────────────────────────────────────────────────── */
 
-const currentQuestion = computed<Question | null>(() => questions.value[currentIndex.value] ?? null);
+const currentQuestion = computed<Question | null>(
+  () => questions.value[currentIndex.value] ?? null,
+);
 
 const currentResponse = computed<UserResponse | null>(() => {
   if (!currentQuestion.value) return null;
@@ -57,12 +72,8 @@ const currentResponse = computed<UserResponse | null>(() => {
 });
 
 const formattedTime = computed(() => {
-  const m = Math.floor(remainingSeconds.value / 60)
-    .toString()
-    .padStart(2, '0');
-  const s = Math.floor(remainingSeconds.value % 60)
-    .toString()
-    .padStart(2, '0');
+  const m = Math.floor(remainingSeconds.value / 60).toString().padStart(2, '0');
+  const s = Math.floor(remainingSeconds.value % 60).toString().padStart(2, '0');
   return `${m}:${s}`;
 });
 
@@ -90,70 +101,107 @@ const paletteClasses: Record<ResponseFlag, string> = {
   unvisited: 'bg-white text-ink-500 border-ink-200',
 };
 
-/* -------------------------------------------------------------------------- */
-/*  Lifecycle: load exam + set up timer worker + network listeners            */
-/* -------------------------------------------------------------------------- */
+/* ── Lifecycle: load exam ───────────────────────────────────────────────── */
 
 onMounted(async () => {
-  isLoading.value = true;
-
-  const loadedSession = await db.exam_sessions.get(props.examSessionId);
-  if (!loadedSession) {
-    isLoading.value = false;
-    return;
-  }
-  session.value = loadedSession;
-
-  const loadedQuestions = await Promise.all(loadedSession.questionOrder.map((qid) => db.questions.get(qid)));
-  questions.value = loadedQuestions.filter((q): q is Question => Boolean(q));
-
-  const existingResponses = await db.user_responses
-    .where('examSessionId')
-    .equals(props.examSessionId)
-    .toArray();
-
-  const map = new Map<string, UserResponse>();
-  for (const r of existingResponses) map.set(r.questionId, r);
-
-  const toCreate: UserResponse[] = [];
-  for (const q of questions.value) {
-    if (!map.has(q.id)) {
-      const fresh: UserResponse = {
-        id: uid('resp'),
-        userId: props.userId,
-        examSessionId: props.examSessionId,
-        questionId: q.id,
-        topicId: q.topicId,
-        subjectId: q.subjectId,
-        selectedOptionKey: null,
-        isCorrect: null,
-        flag: 'unvisited',
-        timeSpentSeconds: 0,
-        answeredAt: null,
-        syncedToServer: false,
-      };
-      map.set(q.id, fresh);
-      toCreate.push(fresh);
-    }
-  }
-  if (toCreate.length > 0) {
-    await db.user_responses.bulkAdd(toCreate);
-  }
-  responsesByQuestionId.value = map;
-
-  startTimerWorker(loadedSession.remainingSeconds || loadedSession.durationSeconds);
-
   window.addEventListener('online', handleOnline);
   window.addEventListener('offline', handleOffline);
+  window.addEventListener('keydown', handleKeydown);
 
-  isLoading.value = false;
+  isLoading.value = true;
+
+  try {
+    // ── 1. Load session from Dexie (primary during exam) ──
+    let loadedSession = await db.exam_sessions.get(props.examSessionId) as
+      | (ExamSession & { questionOrder?: string[] })
+      | undefined;
+
+    // Fallback: Firestore
+    if (!loadedSession) {
+      try {
+        const snap = await getDoc(doc(firestore, 'exam_sessions', props.examSessionId));
+        if (snap.exists()) {
+          loadedSession = { id: snap.id, ...snap.data() } as ExamSession & { questionOrder?: string[] };
+          await db.exam_sessions.put(loadedSession as any);
+        }
+      } catch { /* offline */ }
+    }
+
+    if (!loadedSession) return;
+    session.value = loadedSession;
+
+    // ── 2. Load questions from local cache ──
+    const questionOrder = loadedSession.questionOrder ?? [];
+    const loadedQuestions: Question[] = [];
+
+    for (const qid of questionOrder) {
+      // Try local cache first (fast)
+      let q = await db.questions.get(qid) as Question | undefined;
+
+      // Fallback: fetch from Firestore
+      if (!q) {
+        try {
+          const snap = await getDoc(doc(firestore, 'questions', qid));
+          if (snap.exists()) {
+            q = { id: snap.id, ...snap.data() } as Question;
+            await db.questions.put(q as any); // cache for offline
+          }
+        } catch { /* offline */ }
+      }
+
+      if (q) loadedQuestions.push(q);
+    }
+
+    questions.value = loadedQuestions;
+
+    // ── 3. Load existing responses ──
+    const existingResponses = await db.user_responses
+      .where('examSessionId')
+      .equals(props.examSessionId)
+      .toArray() as UserResponse[];
+
+    const map = new Map<string, UserResponse>();
+    for (const r of existingResponses) map.set(r.questionId, r);
+
+    const toCreate: UserResponse[] = [];
+    for (const q of questions.value) {
+      if (!map.has(q.id)) {
+        const fresh: UserResponse = {
+          id: uid('resp'),
+          userId: props.userId,
+          examSessionId: props.examSessionId,
+          questionId: q.id,
+          topicId: q.topicId,
+          subjectId: q.subjectId,
+          selectedOptionKey: null,
+          isCorrect: null,
+          flag: 'unvisited',
+          timeSpentSeconds: 0,
+          answeredAt: null,
+          syncedToServer: false,
+        };
+        map.set(q.id, fresh);
+        toCreate.push(fresh);
+      }
+    }
+    if (toCreate.length > 0) {
+      await db.user_responses.bulkAdd(toPlain(toCreate));
+    }
+    responsesByQuestionId.value = map;
+
+    startTimerWorker(loadedSession.remainingSeconds ?? loadedSession.durationSeconds);
+  } finally {
+    isLoading.value = false;
+  }
 });
 
 onBeforeUnmount(() => {
-  timerWorker?.postMessage({ type: 'STOP' });
+  stopTimer();
   timerWorker?.terminate();
+  timerWorker = null;
   window.removeEventListener('online', handleOnline);
   window.removeEventListener('offline', handleOffline);
+  window.removeEventListener('keydown', handleKeydown);
 });
 
 function handleOnline() {
@@ -163,58 +211,69 @@ function handleOffline() {
   isOnline.value = false;
 }
 
-/* -------------------------------------------------------------------------- */
-/*  Timer worker wiring                                                       */
-/* -------------------------------------------------------------------------- */
+/* ── Timer worker ───────────────────────────────────────────────────────── */
 
 function startTimerWorker(durationSeconds: number) {
-  timerWorker = new Worker(new URL('../workers/timer.worker.ts', import.meta.url), { type: 'module' });
+  timerWorker = new Worker(
+    new URL('../workers/timer.worker.ts', import.meta.url),
+    { type: 'module' },
+  );
 
   timerWorker.onmessage = (event: MessageEvent<{ type: string; remainingSeconds: number }>) => {
     const { type, remainingSeconds: rs } = event.data;
     remainingSeconds.value = rs;
 
-    if (type === 'WARNING') {
-      isWarningActive.value = true;
-    }
+    if (type === 'WARNING') isWarningActive.value = true;
     if (type === 'EXPIRED') {
-      void autoSubmit();
+      if (isSubmitting.value) {
+        expiredWhileSubmitting = true;
+      } else {
+        void autoSubmit();
+      }
     }
     if ((type === 'TICK' || type === 'WARNING') && session.value && rs % 5 === 0) {
-      void db.exam_sessions.update(session.value.id, { remainingSeconds: rs });
+      void db.exam_sessions.update(session.value.id, { remainingSeconds: rs } as any);
     }
   };
 
   timerWorker.postMessage({ type: 'START', durationSeconds });
 }
 
-/* -------------------------------------------------------------------------- */
-/*  Answer persistence — optimistic writes to IndexedDB                       */
-/* -------------------------------------------------------------------------- */
+function stopTimer() {
+  timerWorker?.postMessage({ type: 'STOP' });
+}
+
+/* ── Answer persistence ─────────────────────────────────────────────────── */
+
+function commitResponse(updated: UserResponse) {
+  const next = new Map(responsesByQuestionId.value);
+  next.set(updated.questionId, updated);
+  responsesByQuestionId.value = next;
+  return db.user_responses.put(toPlain(updated));
+}
 
 async function selectOption(optionKey: QuestionOption['key']) {
   const q = currentQuestion.value;
-  if (!q || !session.value) return;
+  if (!q || !session.value || isSubmitting.value) return;
 
   const prev = responsesByQuestionId.value.get(q.id);
-  const wasFlagged = prev?.flag === 'flagged' || prev?.flag === 'flagged-answered';
+  if (!prev) return;
+  const wasFlagged = prev.flag === 'flagged' || prev.flag === 'flagged-answered';
 
   const updated: UserResponse = {
-    ...(prev as UserResponse),
+    ...prev,
     selectedOptionKey: optionKey,
     isCorrect: optionKey === q.correctOptionKey,
     flag: wasFlagged ? 'flagged-answered' : 'answered',
     answeredAt: new Date().toISOString(),
   };
 
-  responsesByQuestionId.value.set(q.id, updated);
-  responsesByQuestionId.value = new Map(responsesByQuestionId.value);
-  await db.user_responses.put(updated);
+  await commitResponse(updated);
 }
 
 async function toggleFlag() {
   const q = currentQuestion.value;
-  if (!q) return;
+  if (!q || isSubmitting.value) return;
   const prev = responsesByQuestionId.value.get(q.id);
   if (!prev) return;
 
@@ -224,21 +283,15 @@ async function toggleFlag() {
   else if (prev.flag === 'answered') nextFlag = 'flagged-answered';
   else nextFlag = 'flagged';
 
-  const updated: UserResponse = { ...prev, flag: nextFlag };
-  responsesByQuestionId.value.set(q.id, updated);
-  responsesByQuestionId.value = new Map(responsesByQuestionId.value);
-  await db.user_responses.put(updated);
+  await commitResponse({ ...prev, flag: nextFlag });
 }
 
-/* -------------------------------------------------------------------------- */
-/*  Navigation                                                                */
-/* -------------------------------------------------------------------------- */
+/* ── Navigation ─────────────────────────────────────────────────────────── */
 
 function goTo(index: number) {
   if (index < 0 || index >= questions.value.length) return;
   currentIndex.value = index;
 }
-
 function next() {
   goTo(currentIndex.value + 1);
 }
@@ -246,49 +299,51 @@ function prev() {
   goTo(currentIndex.value - 1);
 }
 
-/* -------------------------------------------------------------------------- */
-/*  Hotkeys (A–D select option, arrows navigate)                              */
-/* -------------------------------------------------------------------------- */
+/* ── Hotkeys ────────────────────────────────────────────────────────────── */
 
 function handleKeydown(e: KeyboardEvent) {
+  if (confirmSubmitOpen.value || isSubmitting.value) return;
+  if (e.ctrlKey || e.metaKey || e.altKey) return;
+
   const key = e.key.toUpperCase();
   const optionKeys: QuestionOption['key'][] = ['A', 'B', 'C', 'D', 'E'];
+
   if (optionKeys.includes(key as QuestionOption['key'])) {
     const exists = currentQuestion.value?.options.some((o) => o.key === key);
     if (exists) void selectOption(key as QuestionOption['key']);
-  } else if (e.key === 'ArrowRight') {
-    next();
-  } else if (e.key === 'ArrowLeft') {
-    prev();
-  } else if (e.key.toLowerCase() === 'f') {
-    void toggleFlag();
-  }
+  } else if (e.key === 'ArrowRight') next();
+  else if (e.key === 'ArrowLeft') prev();
+  else if (key === 'F') void toggleFlag();
 }
 
-onMounted(() => window.addEventListener('keydown', handleKeydown));
-onBeforeUnmount(() => window.removeEventListener('keydown', handleKeydown));
-
-/* -------------------------------------------------------------------------- */
-/*  Submission (manual + auto)                                                */
-/* -------------------------------------------------------------------------- */
+/* ── Submission ─────────────────────────────────────────────────────────── */
 
 async function gradeAndFinalize(status: ExamSession['status']): Promise<ExamSession> {
   if (!session.value) {
-    // This is the failure mode that used to make the Submit button look
-    // "broken" — the exam session record was missing (e.g. a stale/expired
-    // reference) and the handler silently no-opped instead of surfacing
-    // anything to the candidate. Throw instead so the caller can show an
-    // error and the button never just sits there doing nothing.
-    throw new Error('Could not find your exam session. Your answers are saved — please go back and try submitting again.');
+    throw new Error(
+      'Could not find your exam session. Your answers are saved — please try submitting again.',
+    );
   }
 
   const allResponses = Array.from(responsesByQuestionId.value.values());
   const correctCount = allResponses.filter((r) => r.isCorrect === true).length;
-  const wrongCount = allResponses.filter((r) => r.selectedOptionKey !== null && r.isCorrect === false).length;
+  const wrongCount = allResponses.filter(
+    (r) => r.selectedOptionKey !== null && r.isCorrect === false,
+  ).length;
   const unansweredCount = allResponses.filter((r) => r.selectedOptionKey === null).length;
-  const scorePercent = questions.value.length > 0 ? Math.round((correctCount / questions.value.length) * 100) : 0;
 
-  const updatedSession: ExamSession = {
+  // ★ SCORE = correct / TOTAL questions (not just answered)
+  const totalQuestions = questions.value.length;
+  const scorePercent = totalQuestions > 0
+    ? Math.round((correctCount / totalQuestions) * 100)
+    : 0;
+
+  console.log(
+    `[Exam] Graded: ${correctCount} correct / ${wrongCount} wrong / ` +
+    `${unansweredCount} unanswered / ${totalQuestions} total = ${scorePercent}%`,
+  );
+
+  const updatedSession: ExamSession = toPlain({
     ...session.value,
     status,
     submittedAt: new Date().toISOString(),
@@ -297,10 +352,39 @@ async function gradeAndFinalize(status: ExamSession['status']): Promise<ExamSess
     wrongCount,
     unansweredCount,
     remainingSeconds: status === 'auto-submitted' ? 0 : remainingSeconds.value,
-  };
+  });
 
-  await db.exam_sessions.put(updatedSession);
+  // ── 1. Save to Dexie (local) ──
+  await db.exam_sessions.put(updatedSession as any);
   session.value = updatedSession;
+
+  // ── 2. ★ THE FIX: Sync graded session to Firestore ──
+  //    PerformanceDashboard reads from Firestore — without this, it sees
+  //    the old ungraded session (scorePercent: null → 0%).
+  try {
+    await updateDoc(doc(firestore, 'exam_sessions', updatedSession.id), {
+      status,
+      submittedAt: updatedSession.submittedAt,
+      scorePercent,
+      correctCount,
+      wrongCount,
+      unansweredCount,
+      remainingSeconds: updatedSession.remainingSeconds,
+    });
+  } catch {
+    // Offline — will sync later
+    console.warn('[Exam] Could not sync session to Firestore — will retry later');
+  }
+
+  // ── 3. ★ Sync graded responses to Firestore ──
+  for (const response of allResponses) {
+    try {
+      await setDoc(doc(firestore, 'user_responses', response.id), response);
+    } catch {
+      break; // offline — stop trying
+    }
+  }
+
   return updatedSession;
 }
 
@@ -308,17 +392,25 @@ async function submitExam() {
   if (isSubmitting.value) return;
   isSubmitting.value = true;
   submitError.value = null;
+  expiredWhileSubmitting = false;
+
+  let failed = false;
   try {
-    // Stop the timer first so no further TICK/WARNING/EXPIRED messages can
-    // race with (or duplicate) this manual submission.
-    timerWorker?.postMessage({ type: 'STOP' });
     const finalizedSession = await gradeAndFinalize('submitted');
+    stopTimer();
     confirmSubmitOpen.value = false;
     emit('exam-submitted', finalizedSession);
   } catch (err) {
-    submitError.value = err instanceof Error ? err.message : 'Something went wrong submitting your exam. Please try again.';
+    failed = true;
+    submitError.value =
+      err instanceof Error ? err.message : 'Something went wrong submitting your exam.';
   } finally {
     isSubmitting.value = false;
+  }
+
+  if (failed && expiredWhileSubmitting) {
+    expiredWhileSubmitting = false;
+    void autoSubmit();
   }
 }
 
@@ -328,17 +420,16 @@ async function autoSubmit() {
   submitError.value = null;
   try {
     const finalizedSession = await gradeAndFinalize('auto-submitted');
+    stopTimer();
     confirmSubmitOpen.value = false;
     emit('exam-submitted', finalizedSession);
   } catch (err) {
-    submitError.value = err instanceof Error ? err.message : 'Something went wrong auto-submitting your exam.';
+    submitError.value =
+      err instanceof Error ? err.message : 'Something went wrong auto-submitting your exam.';
   } finally {
     isSubmitting.value = false;
   }
 }
-
-const confirmSubmitOpen = ref(false);
-const submitError = ref<string | null>(null);
 </script>
 
 <template>
@@ -356,7 +447,6 @@ const submitError = ref<string | null>(null);
               <Coins class="w-4 h-4" />
               {{ props.creditBalance }}
             </span>
-
             <span
               class="inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px] font-mono font-medium border"
               :class="isOnline ? 'bg-brand-500/15 border-brand-400/30 text-pulse' : 'bg-white/5 border-white/10 text-ink-100/70'"
@@ -366,7 +456,6 @@ const submitError = ref<string | null>(null);
               {{ isOnline ? 'ONLINE' : 'OFFLINE — CONTINUES NORMALLY' }}
             </span>
           </div>
-
           <div
             class="readout text-lg px-4 py-2"
             :class="isWarningActive ? 'bg-coral text-white animate-pulse' : 'bg-white/10 text-pulse'"
@@ -400,7 +489,9 @@ const submitError = ref<string | null>(null);
             </button>
           </div>
 
-          <p class="font-display text-lg text-ink-900 leading-relaxed mb-6">{{ currentQuestion.stem }}</p>
+          <p class="font-display text-lg text-ink-900 leading-relaxed mb-6">
+            {{ currentQuestion.stem }}
+          </p>
 
           <div class="space-y-3 flex-1">
             <button
@@ -438,7 +529,6 @@ const submitError = ref<string | null>(null);
             >
               <ChevronLeft class="w-4 h-4" /> Previous
             </button>
-
             <button
               v-if="currentIndex < questions.length - 1"
               type="button"
@@ -460,8 +550,9 @@ const submitError = ref<string | null>(null);
 
         <!-- Question palette -->
         <aside class="bg-white rounded-3xl border border-ink-100 shadow-card p-4 h-fit lg:sticky lg:top-24">
-          <h3 class="text-xs font-mono font-semibold text-ink-400 tracking-wide mb-3">QUESTION PALETTE</h3>
-
+          <h3 class="text-xs font-mono font-semibold text-ink-400 tracking-wide mb-3">
+            QUESTION PALETTE
+          </h3>
           <div class="grid grid-cols-5 gap-2 mb-4">
             <button
               v-for="(q, idx) in questions"
@@ -474,7 +565,6 @@ const submitError = ref<string | null>(null);
               {{ idx + 1 }}
             </button>
           </div>
-
           <div class="space-y-1.5 text-xs text-ink-600">
             <div class="flex items-center justify-between">
               <span class="flex items-center gap-1.5"><CheckCircle2 class="w-3.5 h-3.5 text-brand-500" /> Answered</span>
@@ -489,7 +579,6 @@ const submitError = ref<string | null>(null);
               <span class="font-mono font-semibold">{{ progressStats.unvisited }}</span>
             </div>
           </div>
-
           <button
             type="button"
             class="w-full mt-4 inline-flex items-center justify-center gap-1.5 rounded-xl px-4 py-2.5 text-sm font-semibold bg-brand-700 text-white hover:bg-brand-800 transition-colors"
@@ -501,23 +590,30 @@ const submitError = ref<string | null>(null);
       </div>
 
       <!-- Submit confirmation modal -->
-      <div v-if="confirmSubmitOpen" class="fixed inset-0 z-30 bg-ink-900/50 backdrop-blur-sm flex items-center justify-center p-4">
+      <div
+        v-if="confirmSubmitOpen"
+        class="fixed inset-0 z-30 bg-ink-900/50 backdrop-blur-sm flex items-center justify-center p-4"
+      >
         <div class="bg-white rounded-3xl shadow-panel max-w-sm w-full p-6 animate-popIn">
           <h4 class="font-display text-lg font-bold text-ink-900 mb-2">Submit exam?</h4>
           <p class="text-sm text-ink-500 mb-5">
-            You've answered <span class="font-mono font-semibold text-ink-700">{{ progressStats.answered }}</span> of
-            <span class="font-mono font-semibold text-ink-700">{{ progressStats.total }}</span> questions.
-            {{ progressStats.total - progressStats.answered }} remain unanswered. This cannot be undone.
+            You've answered
+            <span class="font-mono font-semibold text-ink-700">{{ progressStats.answered }}</span>
+            of <span class="font-mono font-semibold text-ink-700">{{ progressStats.total }}</span>
+            questions. {{ progressStats.total - progressStats.answered }} remain unanswered.
+            This cannot be undone.
           </p>
-
-          <p v-if="submitError" class="flex items-start gap-1.5 text-sm text-coral-dim bg-coral-soft border border-coral/30 rounded-xl px-3.5 py-2.5 mb-4">
+          <p
+            v-if="submitError"
+            class="flex items-start gap-1.5 text-sm text-coral-dim bg-coral-soft border border-coral/30 rounded-xl px-3.5 py-2.5 mb-4"
+          >
             {{ submitError }}
           </p>
-
           <div class="flex gap-3 justify-end">
             <button
               type="button"
-              class="px-4 py-2.5 rounded-xl text-sm font-medium border border-ink-200 text-ink-600"
+              class="px-4 py-2.5 rounded-xl text-sm font-medium border border-ink-200 text-ink-600 disabled:opacity-50"
+              :disabled="isSubmitting"
               @click="confirmSubmitOpen = false"
             >
               Keep Reviewing

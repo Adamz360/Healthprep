@@ -1,11 +1,17 @@
+<!-- src/views/WeakAreasView.vue -->
 <script setup lang="ts">
-import { ref, onMounted } from 'vue';
+import { ref, computed, onMounted } from 'vue';
 import { useRouter } from 'vue-router';
-import { ChevronLeft, TrendingDown, TrendingUp, Minus, RotateCcw } from 'lucide-vue-next';
+import { ChevronLeft, TrendingDown, RotateCcw } from 'lucide-vue-next';
+import {
+  getDocs, setDoc,doc,
+  collection, query, where,
+} from 'firebase/firestore';
+import { firestore } from '../firebase';
+import { uid, db as localDb } from '../db/schema';
 import { useAuthStore } from '../stores/auth';
 import { useWeakAreaEngine } from '../composables/useWeakAreaEngine';
-import { db, uid } from '../db';
-import type { ExamSession, TopicMastery } from '../types/healthApp';
+import type { ExamSession, Question } from '../types/healthApp';
 
 const router = useRouter();
 const auth = useAuthStore();
@@ -14,28 +20,39 @@ const engine = useWeakAreaEngine(auth.userId);
 const isStartingDrill = ref(false);
 
 onMounted(async () => {
-  await engine.refreshAll(10);
+  await engine.build();
 });
 
-const levelStyles: Record<TopicMastery['masteryLevel'], { badge: string; icon: typeof TrendingDown }> = {
-  weak: { badge: 'bg-coral text-white', icon: TrendingDown },
-  developing: { badge: 'bg-gold text-ink-900', icon: Minus },
-  strong: { badge: 'bg-brand-500 text-white', icon: TrendingUp },
-};
+const overallAccuracyPercent = computed(() => engine.overallAccuracyPercent.value);
+
 
 async function startWeakAreaDrill() {
   if (!auth.userId || engine.recommendations.value.length === 0) return;
   isStartingDrill.value = true;
 
   try {
-    const questionIds = engine.recommendations.value.flatMap((r) => r.recommendedQuestionIds).slice(0, 25);
-    if (questionIds.length === 0) return;
+    // Fetch questions for weak topics from Firestore
+    const weakTopicIds = engine.recommendations.value.map((r) => r.topicId);
+    const questions: Question[] = [];
 
-    const firstTopic = engine.recommendations.value[0].topic;
+    for (const topicId of weakTopicIds) {
+      const snap = await getDocs(
+        query(collection(firestore, 'questions'), where('topicId', '==', topicId)),
+      );
+      questions.push(...snap.docs.map((d) => ({ id: d.id, ...d.data() }) as Question));
+    }
+
+    // Shuffle and pick up to 25
+    const shuffled = [...questions].sort(() => Math.random() - 0.5).slice(0, 25);
+    if (shuffled.length === 0) return;
+
+    const firstSubjectId = engine.recommendations.value[0].subjectId;
+    const questionIds = shuffled.map((q) => q.id);
+
     const newSession: ExamSession = {
       id: uid('exam'),
       userId: auth.userId,
-      subjectId: firstTopic.subjectId,
+      subjectId: firstSubjectId,
       departmentId: auth.currentUser?.departmentId ?? '',
       mode: 'weak-area-drill',
       totalQuestions: questionIds.length,
@@ -49,10 +66,22 @@ async function startWeakAreaDrill() {
       wrongCount: null,
       unansweredCount: null,
       questionOrder: questionIds,
-    };
+    } as any;
 
-    await db.exam_sessions.add(newSession);
+    // Save to Firestore (primary) and local cache (offline fallback)
+    try {
+      await setDoc(doc(firestore, 'exam_sessions', newSession.id), newSession);
+    } catch {
+      // offline — save locally only
+    }
+    await localDb.exam_sessions.put(newSession as any);
+
+    // Cache the questions for offline exam
+    await localDb.questions.bulkPut(shuffled);
+
     router.push({ name: 'exam-session', params: { examSessionId: newSession.id } });
+  } catch (err) {
+    console.error('[WeakAreas] Failed to start drill:', err);
   } finally {
     isStartingDrill.value = false;
   }
@@ -68,18 +97,24 @@ async function startWeakAreaDrill() {
         </button>
         <div>
           <h1 class="font-display font-bold text-ink-900">Weak Area Analysis</h1>
-          <p class="text-xs text-ink-500 font-mono">Overall accuracy: {{ engine.overallAccuracyPercent.value }}%</p>
+          <p class="text-xs text-ink-500 font-mono">
+            Overall accuracy: {{ overallAccuracyPercent }}%
+          </p>
         </div>
       </div>
     </header>
 
     <div class="max-w-2xl mx-auto px-4 py-5">
-      <div v-if="engine.isAnalyzing.value" class="text-sm text-ink-300 text-center py-16">Analyzing your history…</div>
+      <div v-if="engine.isLoading.value" class="text-sm text-ink-300 text-center py-16">
+        Analyzing your history…
+      </div>
 
       <template v-else>
-        <div v-if="engine.topicMastery.value.length === 0" class="text-center py-16">
-          <p class="text-sm text-ink-500">No graded attempts yet.</p>
-          <p class="text-xs text-ink-300 mt-1">Complete a few practice quizzes and your weak areas will show up here.</p>
+        <div v-if="engine.recommendations.value.length === 0" class="text-center py-16">
+          <p class="text-sm text-ink-500">No weak areas detected yet.</p>
+          <p class="text-xs text-ink-300 mt-1">
+            Complete a few practice quizzes and your weak areas will show up here.
+          </p>
         </div>
 
         <template v-else>
@@ -95,17 +130,26 @@ async function startWeakAreaDrill() {
 
           <div class="space-y-2.5">
             <div
-              v-for="topic in engine.topicMastery.value"
+              v-for="topic in engine.recommendations.value"
               :key="topic.topicId"
               class="bg-white rounded-2xl border border-ink-100 shadow-card px-4 py-3.5"
             >
               <div class="flex items-center justify-between gap-3">
                 <div class="min-w-0">
                   <p class="text-sm font-medium text-ink-900">{{ topic.topicPath }}</p>
-                  <p class="text-xs text-ink-500 mt-0.5 font-mono">{{ topic.correctAttempts }}/{{ topic.totalAttempts }} correct</p>
+                  <p class="text-xs text-ink-500 mt-0.5 font-mono">
+                    {{ topic.recommendedQuestionCount }} questions recommended
+                  </p>
                 </div>
-                <span class="readout text-xs shrink-0" :class="levelStyles[topic.masteryLevel].badge">
-                  <component :is="levelStyles[topic.masteryLevel].icon" class="w-3.5 h-3.5" />
+                <span
+                  class="readout text-xs shrink-0"
+                  :class="{
+                    'bg-coral text-white': topic.masteryLevel === 'weak' || topic.masteryLevel === 'critical',
+                    'bg-gold text-ink-900': topic.masteryLevel === 'developing',
+                    'bg-brand-500 text-white': topic.masteryLevel === 'strong',
+                  }"
+                >
+                  <TrendingDown class="w-3.5 h-3.5" />
                   {{ topic.accuracyPercent }}%
                 </span>
               </div>
